@@ -4,8 +4,8 @@ from tqdm import tqdm
 import torch
 import triton
 
-from models.attention.flash_attn_triton_for_hyper import flash_attn_func
-from models.attention.hyper_attn import HyperAttention
+from models.attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
+from models.attention.hyper_attn.hyper_attn import HyperAttention
 
 try:
     from flash_attn import flash_attn_func as flash_attn_func_cuda
@@ -64,7 +64,7 @@ def run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
         sample_size=sample_size,
         min_seq_len=4096,
         cuda=cuda).to(device='cuda', dtype=q.dtype)
-    
+
     fn = lambda: attn(q, k, v, causal=causal)
 
     if mode == 'fwd':
@@ -89,7 +89,7 @@ def main():
         print(f"{arg_name:<16} : {arg_var}")
 
     seq_lens = [2**i for i in range(10, 18)]
-    
+
     attn_method = args.attn_method # ['flash', 'hyper']
     mode = args.mode # ['fwd', 'bwd', 'fwd+bwd']
     batch_size, head_size, dim = 1, 32, 64
@@ -108,11 +108,9 @@ def main():
             ms = run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode, impl="cuda")
         else:
             raise NotImplementedError
-        
+
         print(f"[{mode:<8}], {attn_method}, seq_len: {seq_len:<8}, causal: {causal}, ms: {ms[0]:.5f} ({ms[1]:.5f}, {ms[2]:.5f}) | ")
 
 
 if __name__ == "__main__":
     main()
-
-

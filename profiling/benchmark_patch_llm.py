@@ -7,7 +7,7 @@ from torch.nn import CrossEntropyLoss
 from datasets import load_dataset, concatenate_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from models.replace_llm_attention import patch_attention_layers
+from tests.replace_llm_attention import patch_attention_layers
 
 
 def get_model_and_tokenizer(model_name):
@@ -17,7 +17,7 @@ def get_model_and_tokenizer(model_name):
         model = AutoModelForCausalLM.from_pretrained("THUDM/chatglm2-6b-32k", trust_remote_code=True)
     else:
         raise NotImplementedError("Currently we only support chatglm2")
-        
+
     return model, tokenizer
 
 
@@ -54,7 +54,7 @@ def main():
     dataset_names = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
         "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
         "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
-    
+
     data_subset_all = []
     for dataset in dataset_names:
         data_ = load_dataset('THUDM/LongBench', f"{dataset}", split='test')
@@ -72,7 +72,7 @@ def main():
             continue
         encoded_texts.append(encoded_text)
     print(f"# of data longer than {args.seq_len}: {len(encoded_texts)}")
-    
+
     if args.attn_method != 'flash':
         patch_attention_layers(model=model, **args.__dict__)
 
@@ -90,7 +90,7 @@ def main():
             encoded_batch = encoded_batch['input_ids']
         elif type(encoded_batch) == list:
             encoded_batch = encoded_batch[0]
-        
+
         encoded_batch = encoded_batch.to(device)
         attn_mask = torch.ones_like(encoded_batch)
 
@@ -110,9 +110,9 @@ def main():
         ppls += perplexity_batch.tolist()
 
         pbar.set_description(f"[{bid:<4}/{len(encoded_texts)}] avg_ppls: {np.mean(np.array(ppls)[~np.isnan(np.array(ppls))]):.4f}")
-        
+
         del out_logits, encoded_batch, attn_mask, shift_logits, shift_labels, shift_attention_mask_batch, perplexity_batch
-        
+
 
     nan_cnt = sum(np.isnan(np.array(ppls)))
     ppl_mean = np.mean(np.array(ppls)[~np.isnan(np.array(ppls))])

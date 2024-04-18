@@ -1,0 +1,8 @@
+[project]
+name = "attention"
+requires-python = ">=3.10"
+version = "0.1.dev0"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["attention.*"]

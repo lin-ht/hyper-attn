@@ -5,17 +5,17 @@ try:
 except ImportError:
     flash_attn_func_cuda = None
 
-from .flash_attn_triton_for_hyper import flash_attn_func
+from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
 
 
 def indexing(x, indices, chunk_size=-1):
-    """ 
+    """
     inputs:
-        - x: 4d-tensor with shape [b, h, n, d] 
+        - x: 4d-tensor with shape [b, h, n, d]
         - indices: 3d-tensor with shape [b, h, s] where each entry should be in [0, n-1]
     output:
         - out: 4d-tensor with shape [b, h, s, d] where out[i,j] = x[i,j][indices[i,j],:]
-    
+
     A naive implementation:
         out = torch.zeros(b, h, s, d)
         for i in range(b):
@@ -43,9 +43,9 @@ def add_self_attentions(attn1, lse1, attn2, lse2):
         = (attn1 * exp(lse1) + attn2 * exp(lse2)) / (exp(lse1) + exp(lse2))
         = (attn1 + attn2 * exp(lse2 - lse1)) / (1 + exp(lse2-lse1))
         = attn1 * c + attn2 * (1-c), where c=1/(1 + exp(lse2-lse1)),
-        - lse 
-        = log(exp(lse1) + exp(lse2)) 
-        = log(exp(lse1) * (1 + exp(lse2 - lse1))) 
+        - lse
+        = log(exp(lse1) + exp(lse2))
+        = log(exp(lse1) * (1 + exp(lse2 - lse1)))
         = lse1 + log(1 + exp(lse2 - lse1)) = lse1 - log(c)
     """
     c = (1 / (1 + (lse2 - lse1).exp())).to(dtype=attn1.dtype)
@@ -67,13 +67,13 @@ def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
         query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
         bias, causal, softmax_scale)
     out = out.transpose(1,2)
-    
+
     lse = lse.detach()
     if lse.shape[2] != out.shape[2]:
         lse = lse[:,:,:out.shape[2]]
     lse = lse.unsqueeze(-1)
     return out, lse
-    
+
 
 def exact_attention_cuda(query, key, value, softmax_scale, causal, bias=None):
     if flash_attn_func_cuda is None:

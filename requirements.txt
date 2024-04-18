@@ -1,0 +1,14 @@
+# This file is used to specify the dependencies of the project
+-e ./models
+
+einops
+# To avoid installation order issues, install flash_attn afterwards with:
+# `pip install flash-attn --no-build-isolation`
+# flash_attn
+numpy
+packaging
+pybind11
+pytest
+torch
+# triton==2.0.0.dev20221202 # This is the version of triton that FlashAttention was implemented with
+triton

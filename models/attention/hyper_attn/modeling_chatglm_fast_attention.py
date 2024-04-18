@@ -1,11 +1,11 @@
 import math
 import torch
 
-from .hyper_attn import HyperAttention
+from attention.hyper_attn.hyper_attn import HyperAttention
 
 # Edited from https://huggingface.co/THUDM/chatglm2-6b-32k/blob/main/modeling_chatglm.py#L194
 class FastCoreAttention(torch.nn.Module):
-    
+
     def __init__(self, config, layer_number, **kwargs):
         super(FastCoreAttention, self).__init__()
 
@@ -30,7 +30,7 @@ class FastCoreAttention(torch.nn.Module):
         self.coeff = coeff
 
         self.attention_dropout = torch.nn.Dropout(config.attention_dropout)
-        
+
         self.attn_method = kwargs.get('attn_method')
         if self.attn_method in ['hyper', 'hyper-cuda']:
             lsh_num_projs = kwargs.get('lsh_num_projs')
@@ -39,14 +39,14 @@ class FastCoreAttention(torch.nn.Module):
             min_seq_len = kwargs.get('min_seq_len')
             self.attn = HyperAttention(
                 input_dim=128,
-                lsh_num_projs=lsh_num_projs, 
+                lsh_num_projs=lsh_num_projs,
                 block_size=block_size,
-                sample_size=sample_size, 
+                sample_size=sample_size,
                 min_seq_len=min_seq_len,
                 cuda='cuda' in self.attn_method)
-        else: 
+        else:
             raise NotImplementedError("Invalid attn_method option")
-        
+
 
     def forward(self,  query_layer, key_layer, value_layer, attention_mask):
 
