@@ -28,6 +28,8 @@ def get_tensors(batch_size, seq_len, head_size, dim):
     return q, k, v
 
 
+
+
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
     q, k, v = get_tensors(batch_size, seq_len, head_size, dim)
     if impl == "cuda":

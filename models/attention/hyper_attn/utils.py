@@ -6,7 +6,7 @@ except ImportError:
     flash_attn_func_cuda = None
 
 from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
-
+from models.attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
 
 def indexing(x, indices, chunk_size=-1):
     """
@@ -58,11 +58,17 @@ def add_self_attentions(attn1, lse1, attn2, lse2):
 
 
 def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
+    # input query.shape = [batch_size, head_size, n_query, dim]
+    # input   key.shape = [batch_size, head_size, n_key,   dim]
     if query.dtype not in [torch.bfloat16, torch.float16]:
+        # qk.shape = [batch_size, head_size, n_query, n_key]
         qk = query @ key.transpose(-1,-2) * softmax_scale
         if causal:
+            qk = qk.tril(0)
             qk += (torch.ones(query.shape[2], key.shape[2], device=query.device) * torch.finfo(query.dtype).min).triu(1).reshape(1,1,query.shape[2], key.shape[2])
+        # out.shape = [batch_size, head_size, n_query, dim]
         out = qk.softmax(dim=-1) @ value
+        # lse.shape = [batch_size, head_size, n_query, 1]
         lse = torch.logsumexp(qk, dim=-1, keepdim=True)
         return out, lse
 
@@ -78,12 +84,21 @@ def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
     return out, lse
 
 
-def exact_attention_cuda(query, key, value, softmax_scale, causal, bias=None):
+def exact_attention_cuda(query, key, value, softmax_scale, causal=False, bias=None):
     if flash_attn_func_cuda is None:
         raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
     out, lse, _ = flash_attn_func_cuda(
         query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
         softmax_scale=softmax_scale, causal=causal, return_attn_probs=True)
+    out = out.transpose(1,2)
+    lse = lse.unsqueeze(-1)
+    return out, lse
+
+
+def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bias=None):
+    out, lse = flash_attn_func_xformers(
+        query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
+        bias=bias, scale=softmax_scale)
     out = out.transpose(1,2)
     lse = lse.unsqueeze(-1)
     return out, lse
