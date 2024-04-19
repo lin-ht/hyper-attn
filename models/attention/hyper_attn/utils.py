@@ -15,6 +15,7 @@ def indexing(x, indices, chunk_size=-1):
         - indices: 3d-tensor with shape [b, h, s] where each entry should be in [0, n-1]
     output:
         - out: 4d-tensor with shape [b, h, s, d] where out[i,j] = x[i,j][indices[i,j],:]
+               out will be padded with 0 to make the second dimension multiples of chunk_size.
 
     A naive implementation:
         out = torch.zeros(b, h, s, d)
@@ -24,6 +25,8 @@ def indexing(x, indices, chunk_size=-1):
         return out
     """
     if chunk_size < 0 or (chunk_size > 0 and x.shape[-2] % chunk_size == 0):
+        # gather along dim=2: out[i,j,s,t] = x[i,j,idx[i,j,s,t],t]
+        # which requires idx having the same dimension as x.
         return x.gather(2, indices.unsqueeze(-1).expand(-1, -1, -1, x.shape[-1]))
     else:
         x = x.gather(2, indices.unsqueeze(-1).expand(-1, -1, -1, x.shape[-1]))

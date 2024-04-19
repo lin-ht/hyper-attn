@@ -113,15 +113,14 @@ class HyperAttention(torch.nn.Module):
         query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
 
         key_block_size = self.block_size
-
-        query_sorted = indexing(query, query_sort_idx, key_block_size)
         key_sorted = indexing(key, key_sort_idx, key_block_size)
         value_sorted = indexing(value, key_sort_idx, key_block_size)
 
         if key_block_size > 0:
 
             num_blocks = key_sorted.shape[2] // key_block_size
-            query_block_size = query_sorted.shape[2] // num_blocks
+            query_block_size = math.ceil(n_query / num_blocks)
+            query_sorted = indexing(query, query_sort_idx, query_block_size)
 
             # Reshape tensors to [batch_size*head_size, 1, block_size, dim] as Flash-attn only allows 4d-tensors
             query_split_per_block = query_sorted.view(-1, 1, query_block_size, dim)
@@ -149,12 +148,15 @@ class HyperAttention(torch.nn.Module):
             if query_sorted.shape[2] != n_query: #query.shape[2]:
                 attn_block, lse_block = attn_block[:,:,:n_query,:], lse_block[:,:,:n_query,:]
                 query_sorted = query_sorted[:,:,:n_query,:]
+            # key and query could be padded differently.
+            if key_sorted.shape[2] != n_key:
                 key_sorted = key_sorted[:,:,:n_key,:]
                 value_sorted = value_sorted[:,:,:n_key,:]
 
         else:
+            # Fall back to flash_attn2
             query_block_size = -1
-            query_block_size = -1
+            query_sorted = indexing(query, query_sort_idx)
             attn_block, lse_block = 0, 0
 
         # 2. Residual low-rank part via uniform sampling
@@ -162,14 +164,14 @@ class HyperAttention(torch.nn.Module):
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > query_block_size) and (n_key > key_block_size):
             sampled_set = torch.randint(n_key, size=(batch_size, head_size, sample_size), device=query_sorted.device)
+            value_subset = indexing(value_sorted, sampled_set)
+            key_subset = indexing(key_sorted, sampled_set)
+            weights = n_key / sample_size
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
             offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
-            weights = n_key / sample_size
-            value_subset = indexing(value_sorted, sampled_set)
-            key_subset = indexing(key_sorted, sampled_set)
-
             if not self.cuda:
+                # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
                 block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
                 block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
                 block_mask = block_mask.to(query_sorted.dtype)
@@ -186,6 +188,7 @@ class HyperAttention(torch.nn.Module):
             else:
                 attn, lse = attn_res, lse_res
         else:
+            # Only one block, no approximation
             attn, lse = attn_block, lse_block
 
         # Re-order rows with the inverse order for query_sorted -> query
