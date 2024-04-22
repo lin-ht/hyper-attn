@@ -32,7 +32,7 @@ TEST_HYPER_ATTN_CONFIGS = [
 ]
 
 TEST_CASES = [
-    (1, 32, 2048, 64, False),
+    (1, 32, 512, 64, False),
     # (1, 32, 2**16, 64, False),
     # (1, 32, 2**16, 64, True),
 ]
@@ -79,6 +79,14 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
         diff_attn_f32 = torch.abs(rst_attn_f32 - exact_attn_f32)
         diff_lse_f32 = torch.abs(rst_lse_f32 - exact_lse_f32)
 
+        print(f"rst_attn[0, 0, 0, :] = \n{rst_attn[0, 0, 0, :]}")
+        print(f"exact_attn[0, 0, 0, :] = \n{exact_attn[0, 0, 0, :]}")
+        print(f"diff_attn_f32[0, 0, 0, :] = \n{diff_attn_f32[0, 0, 0, :]}")
+
+        print(f"rst_lse[0, 0, :10, :] = \n{rst_lse[0, 0, :10, :]}")
+        print(f"exact_lse[0, 0, :10, :] = \n{exact_lse[0, 0, :10, :]}")
+        print(f"diff_lse_f32[0, 0, :10, :] = \n{diff_lse_f32[0, 0, :10, :]}")
+
         for ord_ in ord_list:
             diff_attn_norm = torch.linalg.matrix_norm(diff_attn_f32, ord=ord_)  # By default: dim = (-2, -1)
             exact_attn_norm = torch.linalg.matrix_norm(exact_attn_f32, ord=ord_)
@@ -87,6 +95,7 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
 
             lse_error_ratio = diff_lse_f32/torch.abs(exact_lse_f32)
             max_lse_error_ratio = lse_error_ratio.max().item()
+            print(f"lse_error_ratio[0, 0, :10, :] = \n{lse_error_ratio[0, 0, :10, :]}")
 
             print(f"[{config.impl:<8}], seq_len: {seq_len:<8}, causal: {causal}, ord: {ord_}, max_spectral_error_ratio: {max_spectral_error_ratio:.5f}, max_lse_error_ratio: {max_lse_error_ratio:.5f} | ")
 
