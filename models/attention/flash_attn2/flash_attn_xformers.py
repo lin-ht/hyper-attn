@@ -9,7 +9,7 @@ from xformers.ops import (
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, causal, bias, scale=None, p=0.0):
+    def forward(ctx, query, key, value, bias, causal, scale=None, p=0.0):
         """
         Input tensors query, key, value must be in format
             [Batch, n_seq, n_heads, dim] or [Batch, n_seq, dim],

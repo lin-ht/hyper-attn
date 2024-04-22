@@ -64,7 +64,7 @@ def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
         # qk.shape = [batch_size, head_size, n_query, n_key]
         qk = query @ key.transpose(-1,-2) * softmax_scale
         if causal:
-            qk = qk.tril(0)
+            # wipe out the uper triangular part of qk by adding -inf
             qk += (torch.ones(query.shape[2], key.shape[2], device=query.device) * torch.finfo(query.dtype).min).triu(1).reshape(1,1,query.shape[2], key.shape[2])
         # out.shape = [batch_size, head_size, n_query, dim]
         out = qk.softmax(dim=-1) @ value
@@ -97,7 +97,7 @@ def exact_attention_cuda(query, key, value, softmax_scale, causal=False, bias=No
 def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bias=None):
     out, lse = flash_attn_func_xformers(
         query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
-        causal, bias, softmax_scale)
+        bias, causal, softmax_scale)
 
     out = out.transpose(1,2)
     lse = lse.unsqueeze(-1)
