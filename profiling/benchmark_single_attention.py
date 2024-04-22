@@ -4,20 +4,24 @@ from tqdm import tqdm
 import torch
 import triton
 
-from models.attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
-from models.attention.hyper_attn.hyper_attn import HyperAttention
+from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
+from attention.hyper_attn.hyper_attn import HyperAttention
 
 try:
     from flash_attn import flash_attn_func as flash_attn_func_cuda
-except ImportError:
+except ImportError as e:
     flash_attn_func_cuda = None
-
+    print(f"flash_attn importError: {e}")
 
 def get_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no_causal", action="store_true")
     parser.add_argument("--mode", type=str, default="fwd+bwd", choices=['fwd', 'bwd', 'fwd+bwd'])
-    parser.add_argument("--attn_method", type=str, default="flash", choices=['flash', 'flash-cuda', 'hyper', 'hyper-cuda'])
+    parser.add_argument("--attn_method", type=str, default="flash", choices=['flash', 'hyper'])
+    parser.add_argument("--impl", type=str, default="cuda", choices=['cuda', 'triton', 'xformers'])
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--head_size", type=int, default=32)
+    parser.add_argument("--dim", type=int, default=64)
     return parser.parse_args()
 
 
@@ -28,6 +32,21 @@ def get_tensors(batch_size, seq_len, head_size, dim):
     return q, k, v
 
 
+def do_bench(fn, warmup, rep, mode:str='fwd'):
+    if mode == 'fwd':
+        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
+    elif mode == 'bwd':
+        o = fn()
+        do = torch.randn_like(o)
+        fn = lambda: o.backward(do, retain_graph=True)
+        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
+    else: # mode == 'fwd+bwd'
+        q20_fwd, median_fwd, q80_fwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
+        o = fn()
+        do = torch.randn_like(o)
+        fn = lambda: o.backward(do, retain_graph=True)
+        q20_bwd, median_bwd, q80_bwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
+        return q20_fwd+q20_bwd, median_fwd+median_bwd, q80_fwd+q80_bwd
 
 
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
@@ -36,22 +55,12 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
         if flash_attn_func_cuda is None:
             raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
         fn = lambda: flash_attn_func_cuda(q, k, v, causal=causal)
-    else:
+    elif impl == "triton":
         fn = lambda: flash_attn_func(q, k, v, None, causal, None)[0]
-    if mode == 'fwd':
-        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-    elif mode == 'bwd':
-        o = fn()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-    else: # mode == 'fwd+bwd'
-        q20_fwd, median_fwd, q80_fwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-        o = fn()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        q20_bwd, median_bwd, q80_bwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-        return q20_fwd+q20_bwd, median_fwd+median_bwd, q80_fwd+q80_bwd
+    else:  # impl == "xformers"
+        fn = lambda: flash_attn_func_xformers(q, k, v, None, causal, None)[0]
+
+    return do_bench(fn, warmup, rep, mode=mode)
 
 
 def run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
@@ -69,20 +78,7 @@ def run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
 
     fn = lambda: attn(q, k, v, causal=causal)
 
-    if mode == 'fwd':
-        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-    elif mode == 'bwd':
-        o = fn()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-    else: # mode == 'fwd+bwd'
-        q20_fwd, median_fwd, q80_fwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-        o = fn()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-        q20_bwd, median_bwd, q80_bwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
-        return q20_fwd+q20_bwd, median_fwd+median_bwd, q80_fwd+q80_bwd
+    return do_bench(fn, warmup, rep, mode=mode)
 
 
 def main():
@@ -93,21 +89,18 @@ def main():
     seq_lens = [2**i for i in range(10, 18)]
 
     attn_method = args.attn_method # ['flash', 'hyper']
+    attn_impl = args.impl # ['cuda', 'triton', 'xformers']
     mode = args.mode # ['fwd', 'bwd', 'fwd+bwd']
-    batch_size, head_size, dim = 1, 32, 64
-    print(f"mode: {mode}, attn_method: {attn_method}, batch_size: {batch_size}, head_size: {head_size}, dim: {dim}")
+    batch_size, head_size, dim = args.batch_size, args.head_size, args.dim
+    print(f"mode: {mode}, attn_method: {attn_method}-{attn_impl}, batch_size: {batch_size}, head_size: {head_size}, dim: {dim}")
 
     causal = not args.no_causal
 
     for seq_len in seq_lens:
         if attn_method == 'flash':
-            ms = run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode)
-        elif attn_method == 'flash-cuda':
-            ms = run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode, impl="cuda")
+            ms = run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode, impl=attn_impl)
         elif attn_method == 'hyper':
-            ms = run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode)
-        elif attn_method == 'hyper-cuda':
-            ms = run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode, impl="cuda")
+            ms = run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode=args.mode, impl=attn_impl)
         else:
             raise NotImplementedError
 
