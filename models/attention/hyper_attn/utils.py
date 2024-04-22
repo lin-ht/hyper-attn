@@ -94,11 +94,11 @@ def exact_attention_cuda(query, key, value, softmax_scale, causal=False, bias=No
     lse = lse.unsqueeze(-1)
     return out, lse
 
-
 def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bias=None):
     out, lse = flash_attn_func_xformers(
         query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
-        bias, softmax_scale)
+        causal, bias, softmax_scale)
+
     out = out.transpose(1,2)
     lse = lse.unsqueeze(-1)
     return out, lse
