@@ -67,14 +67,13 @@ def run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
     q, k, v = get_tensors(batch_size, head_size, seq_len, dim)
     block_size = 256
     sample_size = 256
-    cuda = impl=="cuda"
 
     attn = HyperAttention(
         input_dim=dim,
         block_size=block_size,
         sample_size=sample_size,
         min_seq_len=4096,
-        cuda=cuda).to(device='cuda', dtype=q.dtype)
+        impl=impl).to(device='cuda', dtype=q.dtype)
 
     fn = lambda: attn(q, k, v, causal=causal)
 

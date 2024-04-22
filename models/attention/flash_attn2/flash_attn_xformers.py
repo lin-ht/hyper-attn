@@ -31,14 +31,17 @@ class FlashAttnFunc(torch.autograd.Function):
         #     query, key, value, op=None, attn_bias=bias, scale=scale, p=p
         # )
 
-        ctx.save_for_backward(query, key, value, out, lse, bias, scale, p)
+        ctx.save_for_backward(query, key, value, out, lse, bias)
+        ctx.scale = scale
         return out, lse
 
     @staticmethod
-    def backward(ctx, do):
-        query, key, value, out, lse, bias, scale, p = ctx.saved_tensors
+    def backward(ctx, do, dlse_use_needed=None):
+        query, key, value, out, lse, bias = ctx.saved_tensors
+        scale = ctx.scale
+        # dropout is not supported on the non-autograd API
         dq, dk, dv = memory_efficient_attention_backward(
-            do, out, lse, query, key, value, attn_bias=bias, p=p, scale=scale
+            do, out, lse, query, key, value, attn_bias=bias, p=0.0, scale=scale
         )
         return dq, dk, dv, None, None, None
 

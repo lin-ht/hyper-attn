@@ -2,13 +2,19 @@ import math
 import torch
 from einops import rearrange
 
-from attention.hyper_attn.utils import exact_attention, exact_attention_cuda, add_self_attentions, indexing
+from attention.hyper_attn.utils import (
+    exact_attention,
+    exact_attention_cuda,
+    exact_attention_xformers,
+    add_self_attentions,
+    indexing,
+)
 from attention.hyper_attn.angular_lsh import AngularLSH
 
 
 class HyperAttention(torch.nn.Module):
 
-    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, cuda=False):
+    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='xformers'):
         """
         Hyperbolic attention module.
         Input parameters:
@@ -17,7 +23,7 @@ class HyperAttention(torch.nn.Module):
             - block_size: int, the block size for block-diagonal approximation
             - sample_size: int, the number of sampled columns in the attention matrix A
             - min_seq_len: int, the minimum sequence length the hyper_attn is applied to
-            - cuda: bool, whether to use CUDA
+            - impl: str, the implementation of the exact attention
         """
         super().__init__()
         self.input_dim = input_dim
@@ -25,8 +31,15 @@ class HyperAttention(torch.nn.Module):
         self.block_size = block_size
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
-        self.cuda = cuda
+        self.impl = impl
         self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
+
+        if impl == 'xformers':
+            self.exact_attn = exact_attention_xformers
+        elif impl == 'cuda':
+            self.exact_attn = exact_attention_cuda
+        else:
+            self.exact_attn = exact_attention
 
 
     def forward(self, query: torch.tensor, key: torch.tensor, value: torch.tensor, scale=None, causal=False, return_lse=False):
@@ -41,14 +54,10 @@ class HyperAttention(torch.nn.Module):
         # Without causal masking
         if not causal:
             attn, lse = self.forward_no_causal_mask(query, key, value, scale)
-
         # With causal masking
         else:
             if n_key <= self.min_seq_len:
-                if self.cuda:
-                    attn, lse = exact_attention_cuda(query, key, value, scale, causal=True)
-                else:
-                    attn, lse = exact_attention(query, key, value, scale, causal=True)
+                attn, lse = self.exact_attn(query, key, value, scale, causal=True)
             else:
                 # If n_query is odd we pad inputs by adding all-zero rows
                 if n_query % 2:
@@ -102,10 +111,7 @@ class HyperAttention(torch.nn.Module):
         n_key = key.shape[2]
 
         if self.min_seq_len > n_query:
-            if self.cuda:
-                return exact_attention_cuda(query, key, value, scale, causal=False)
-            else:
-                return exact_attention(query, key, value, scale, causal=False)
+            self.exact_attn(query, key, value, scale, causal=False)
 
         # 1. Sorted block-diagonal via sortLSH
         _, query_sort_idx = torch.sort(self.lsh.hash(query), dim=2, stable=True) # batch_size x head_size x n
@@ -127,14 +133,9 @@ class HyperAttention(torch.nn.Module):
             key_split_per_block = key_sorted.view(-1, 1, key_block_size, dim)
             value_split_per_block = value_sorted.view(-1, 1, key_block_size, dim)
 
-            if self.cuda:
-                attn_block, lse_block = exact_attention_cuda(
-                    query_split_per_block, key_split_per_block, value_split_per_block,
-                    softmax_scale=scale, causal=False)
-            else:
-                attn_block, lse_block = exact_attention(
-                    query_split_per_block, key_split_per_block, value_split_per_block,
-                    softmax_scale=scale, causal=False)
+            attn_block, lse_block = self.exact_attn(
+                query_split_per_block, key_split_per_block, value_split_per_block,
+                softmax_scale=scale, causal=False)
 
             if attn_block.shape[2] not in attn_block.stride():
                 attn_block = attn_block.contiguous()
@@ -170,16 +171,17 @@ class HyperAttention(torch.nn.Module):
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
             offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
-            if not self.cuda:
+            if self.impl != "cuda":
                 # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
                 block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
                 block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
                 block_mask = block_mask.to(query_sorted.dtype)
                 block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf added to QK^T
 
-                attn_res, lse_res = exact_attention(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
+                attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
-                attn_res, lse_res = exact_attention_cuda(query_sorted, key_subset, value_subset, scale, causal=False)
+                attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
+
             lse_res = lse_res + math.log(weights)
 
             # Add two attentions
