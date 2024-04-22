@@ -1,15 +1,19 @@
 # This file is used to specify the dependencies of the project
+# python -m pip install -r requirements.txt
 -e ./models
 
 einops
 # To avoid installation order issues, install flash_attn afterwards with:
 # `pip install flash-attn --no-build-isolation`
+# If you have different libcudart, clone the repo and install from source: `python setup.py install`
+# to avoid ImportError('libcudart.so.11.0: cannot open shared object file: No such file or directory')
 # flash_attn
 numpy
 packaging
 pybind11
 pytest
 torch
-# triton==2.0.0.dev20221202 # This is the version of triton that FlashAttention was implemented with
-triton
+tqdm
+triton==2.0.0.dev20221202 # This is the version of triton that FlashAttention was implemented with
+# triton
 xformers

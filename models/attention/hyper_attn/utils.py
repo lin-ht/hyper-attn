@@ -6,7 +6,7 @@ except ImportError:
     flash_attn_func_cuda = None
 
 from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
-from models.attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
+from attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
 
 def indexing(x, indices, chunk_size=-1):
     """
