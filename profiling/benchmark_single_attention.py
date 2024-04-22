@@ -6,6 +6,7 @@ import triton
 
 from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
 from attention.hyper_attn.hyper_attn import HyperAttention
+from attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
 
 try:
     from flash_attn import flash_attn_func as flash_attn_func_cuda
@@ -35,18 +36,18 @@ def get_tensors(batch_size, seq_len, head_size, dim):
 def do_bench(fn, warmup, rep, mode:str='fwd'):
     if mode == 'fwd':
         # with torch.no_grad():
-        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
+        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
     elif mode == 'bwd':
         o = fn()
         do = torch.randn_like(o)
         fn = lambda: o.backward(do, retain_graph=True)
-        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
+        return triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
     else: # mode == 'fwd+bwd'
-        q20_fwd, median_fwd, q80_fwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
+        q20_fwd, median_fwd, q80_fwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
         o = fn()
         do = torch.randn_like(o)
         fn = lambda: o.backward(do, retain_graph=True)
-        q20_bwd, median_bwd, q80_bwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, percentiles=[0.2, 0.5, 0.8])
+        q20_bwd, median_bwd, q80_bwd = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.2, 0.5, 0.8])
         return q20_fwd+q20_bwd, median_fwd+median_bwd, q80_fwd+q80_bwd
 
 
@@ -104,7 +105,7 @@ def main():
         else:
             raise NotImplementedError
 
-        print(f"[{mode:<8}], {attn_method}, seq_len: {seq_len:<8}, causal: {causal}, ms: {ms[0]:.5f} ({ms[1]:.5f}, {ms[2]:.5f}) | ")
+        print(f"[{mode:<8}], {attn_method}, seq_len: {seq_len:<8}, causal: {causal}, ms: {ms[0]:5.5f} ({ms[1]:5.5f}, {ms[2]:5.5f}) | ")
 
 
 if __name__ == "__main__":

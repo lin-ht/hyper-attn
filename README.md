@@ -18,11 +18,11 @@ pip install triton==2.0.0.dev20221202 --no-deps
 
 The repository contains two benchmark experiments under the following files:
 
-1. `benchmark_single_attention_layer.py`:  This code is for a benchmark estimating (GPU) runtimes of HyperAttention and FlashAttention exploring the sequence lengths from 1K to 131k. To run, 
+1. `benchmark_single_attention.py`:  This code is for a benchmark estimating (GPU) runtimes of HyperAttention and FlashAttention exploring the sequence lengths from 1K to 131k. To run, 
     ```shell
-    python benchmark_single_attention_layer.py --attn_method hyper 
+    python profiling/benchmark_single_attention.py --attn_method flash --impl cuda --no_causal
     ```
-    You can choose the computation mode among forward, backward or both. To specify the mode, please add ``--mode fwd`` for forward, ```--mode bwd``` for backward and ```--mode fwd+bwd``` for both. The default is ```fwd+bwd```. Additionally, to simulate attention without causal masking please add ```--no_causal```.
+    You can choose the computation mode among forward, backward or both. To specify the mode, please add ```--mode fwd``` for forward, ```--mode bwd``` for backward and ```--mode fwd+bwd``` for both. The default is ```fwd+bwd```. Additionally, to simulate attention without causal masking please add ```--no_causal```.
 
 
 2. `benchmark_patch_llm.py`:  This code is for a benchmark of computing perplexity of pretrained language models where their self-attention is patched with HyperAttention. We choose [chatglm2-6b-32k](https://huggingface.co/THUDM/chatglm2-6b-32k) model and [LongBench](https://huggingface.co/datasets/THUDM/LongBench) datasets. To run with sequence length 32768

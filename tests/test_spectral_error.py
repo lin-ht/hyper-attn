@@ -9,10 +9,10 @@ from attention.hyper_attn.utils import (
 )
 
 
-def get_tensors(batch_size, seq_len, head_size, dim):
-    q = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+def get_tensors(batch_size, seq_len, head_size, dim, requires_grad=False):
+    q = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+    k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+    v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
     return q, k, v
 
 
@@ -26,13 +26,13 @@ class HyperAttentionConfig:
         self.impl = impl
 
 TEST_HYPER_ATTN_CONFIGS = [
-    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='xformers'),
+    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='xformers'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='cuda'),
-    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='triton'),
+    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='triton'),
 ]
 
 TEST_CASES = [
-    (1, 32, 512, 64, False),
+    (1, 32, 2**13, 64, False),
     # (1, 32, 2**16, 64, False),
     # (1, 32, 2**16, 64, True),
 ]
@@ -45,7 +45,7 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
     seed = 1234
     mode = 'fwd'
     # ord_list = [2, 1, float('inf')]
-    ord_list = [1]
+    ord_list = ['fro']
 
     # set seed
     torch.manual_seed(seed)
@@ -69,10 +69,14 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
         rst_lse_f32 = rst_lse.to(torch.float32)
 
         softmax_scale = dim ** (-0.5)
-        # exact_attn, exact_lse = exact_attention_cuda(q, k, v, softmax_scale, causal=causal)
-        exact_attn, exact_lse = exact_attention(q, k, v, softmax_scale, causal=causal)
+        exact_attn, exact_lse = exact_attention_xformers(q, k, v, softmax_scale, causal=causal)
         exact_attn_f32 = exact_attn.to(torch.float32)
         exact_lse_f32 = exact_lse.to(torch.float32)
+
+        exact_attn2, exact_lse2 = exact_attention_cuda(q, k, v, softmax_scale, causal=causal)
+        # exact_attn, exact_lse = exact_attention(q, k, v, softmax_scale, causal=causal)
+        exact_attn2_f32 = exact_attn2.to(torch.float32)
+        exact_lse2_f32 = exact_lse2.to(torch.float32)
 
         # Use restricter left side value ||Ax||_p <= ||A||_p * ||x||_p
         # to calculate the spectral error ratio.
