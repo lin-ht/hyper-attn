@@ -111,7 +111,7 @@ class HyperAttention(torch.nn.Module):
         n_key = key.shape[2]
 
         if self.min_seq_len > n_query:
-            self.exact_attn(query, key, value, scale, causal=False)
+            return self.exact_attn(query, key, value, scale, causal=False)
 
         # 1. Sorted block-diagonal via sortLSH
         _, query_sort_idx = torch.sort(self.lsh.hash(query), dim=2, stable=True) # batch_size x head_size x n
