@@ -8,17 +8,17 @@ from .angular_lsh import AngularLSH
 
 class HyperAttention(torch.nn.Module):
 
-    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, cuda=False):
+    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl="triton"):
         super().__init__()
         self.input_dim = input_dim
         self.lsh_num_projs = lsh_num_projs
         self.block_size = block_size
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
-        self.cuda = cuda
+        self.cuda = impl=='cuda'
         self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))
 
-        
+
     def forward(self, query: torch.tensor, key: torch.tensor, value: torch.tensor, scale=None, causal=False, return_lse=False):
         query = query.contiguous()
         key = key.contiguous()
@@ -27,9 +27,9 @@ class HyperAttention(torch.nn.Module):
         n_query = query.shape[2]
         batch_size, n_heads, n_key, dim = key.shape
         scale = dim ** (-0.5) if scale is None else scale
-        
+
         # Without causal masking
-        if not causal: 
+        if not causal:
             attn, lse = self.forward_no_causal_mask(query, key, value, scale)
 
         # With causal masking
@@ -40,7 +40,7 @@ class HyperAttention(torch.nn.Module):
                 else:
                     attn, lse = exact_attention(query, key, value, scale, causal=True)
             else:
-            
+
                 # If n_query is odd we pad inputs by adding all-zero rows
                 if n_query % 2:
                     query = torch.nn.functional.pad(query, (0,0,0,1), mode='constant',value=0.)
@@ -50,9 +50,9 @@ class HyperAttention(torch.nn.Module):
                 q_bd = query.view(batch_size, 2*n_heads, query.shape[2]//2, query.shape[-1])
                 k_bd = key.view(batch_size, 2*n_heads, key.shape[2]//2, key.shape[-1])
                 v_bd = value.view(batch_size, 2*n_heads, key.shape[2]//2, value.shape[-1])
-        
+
                 attn_bd, lse_bd = self.forward(q_bd, k_bd, v_bd, scale, True, True)
-                
+
                 if attn_bd.shape[2] not in attn_bd.stride():
                     attn_bd = attn_bd.contiguous()
                 attn_bd = attn_bd.view(batch_size, n_heads, -1, dim)
@@ -63,7 +63,7 @@ class HyperAttention(torch.nn.Module):
 
                 attn_unmasked, lse_unmasked = self.forward_no_causal_mask(
                     query[:, :, key.shape[2]//2:, :],
-                    key[:, :, :key.shape[2]//2, :], 
+                    key[:, :, :key.shape[2]//2, :],
                     value[:, :, :key.shape[2]//2, :], scale)
 
                 attn_up, lse_up = attn_bd[:,:,:query.shape[2]//2,:], lse_bd[:,:,:query.shape[2]//2,:]
@@ -88,11 +88,10 @@ class HyperAttention(torch.nn.Module):
 
 
     def forward_no_causal_mask(self, query, key, value, scale):
-
         batch_size, head_size, n_query, dim = query.shape
         n_key = key.shape[2]
 
-        if self.min_seq_len > n_query:
+        if self.min_seq_len >= n_query:
             if self.cuda:
                 return exact_attention_cuda(query, key, value, scale, causal=False)
             else:
@@ -106,13 +105,14 @@ class HyperAttention(torch.nn.Module):
         key_block_size = self.block_size
 
         query_sorted = indexing(query, query_sort_idx, key_block_size)
+        # print(f"query_sorted[0, 0, 0, :] = {query_sorted.shape}")
         key_sorted = indexing(key, key_sort_idx, key_block_size)
         value_sorted = indexing(value, key_sort_idx, key_block_size)
 
         if key_block_size > 0:
-
             num_blocks = key_sorted.shape[2] // key_block_size
             query_block_size = query_sorted.shape[2] // num_blocks
+            print(f"query_sort_idx[0, 0, -20:] = {query_sort_idx[0, 0, -20:]}")
 
             # Reshape tensors to [batch_size*head_size, 1, block_size, dim] as Flash-attn only allows 4d-tensors
             query_split_per_block = query_sorted.view(-1, 1, query_block_size, dim)
@@ -152,13 +152,16 @@ class HyperAttention(torch.nn.Module):
         # Sample indices uniformly at random
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > query_block_size) and (n_key > key_block_size):
+            # torch.manual_seed(42)
+            print(f"initial_seed = {torch.initial_seed()}, status = {torch.get_rng_state()}")
             sampled_set = torch.randint(n_key, size=(batch_size, head_size, sample_size), device=query_sorted.device)
-            
+            print(f"sampled_set[0,0,-20:]={sampled_set[0,0,-20:]}")
             # Compute mask for hiding A_ij computed in block-diagonal attention
             offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
             weights = n_key / sample_size
             value_subset = indexing(value_sorted, sampled_set)
             key_subset = indexing(key_sorted, sampled_set)
+            print(f"key_subset[0,0,0, -20:]={key_subset[0,0,0,-20:]}")
 
             if not self.cuda:
                 block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
