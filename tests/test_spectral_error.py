@@ -82,17 +82,27 @@ def test_get_tensors():
     w_ = torch.bmm(q_, k_) * (dim ** (-0.5))  # (batch_size * head_size, seq_len, seq_len)
     a = torch.nn.functional.softmax(w_, dim=2).reshape(batch_size, head_size, seq_len, seq_len)
 
-    k_as_q = k.reshape(batch_size * head_size, seq_len, dim)
+    k_as_q = k.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim)
     w_k = torch.bmm(k_as_q, k_) * (dim ** (-0.5))
     a_k = torch.nn.functional.softmax(w_k, dim=2).reshape(batch_size, head_size, seq_len, seq_len)
+    a_k_diag = a_k * torch.eye(seq_len, dtype=torch.bfloat16, device=a.device).unsqueeze_(0).unsqueeze_(0)
+
+    ord = 'fro'
+    diff_a_k = a_k - a_k_diag
+    diff_a_k_norm = torch.linalg.matrix_norm(diff_a_k, ord=ord)  # By default: dim = (-2, -1)
+    exact_a_k_norm = torch.linalg.matrix_norm(a_k, ord=ord)
+    spectral_error_ratio_a_k = diff_a_k_norm / exact_a_k_norm
+    max_spectral_error_ratio_ref = spectral_error_ratio_a_k.max().item()
+
     print(f"a_k[0, 0, 0:{config.block_size}, 0:{config.block_size}] = \n{a_k[0, 0, 0:config.block_size, 0:config.block_size]}")
+    print(f"a_k_diag[0, 0, 0:{config.block_size}, 0:{config.block_size}] = \n{a_k_diag[0, 0, 0:config.block_size, 0:config.block_size]}")
+    print(f"For maxtrix a {a.shape}: max_spectral_error_ratio_ref is {max_spectral_error_ratio_ref:.5f}")
 
     block2d = torch.ones((config.block_size, config.block_size), dtype=torch.bfloat16, device=a.device, requires_grad=False)
     block2d_list = [block2d for _ in range(seq_len // config.block_size)] + [block2d[:seq_len % config.block_size, :seq_len % config.block_size]]
     block_diag_2d = torch.block_diag(*block2d_list).unsqueeze_(0).unsqueeze_(0)
     a_blocks = a * block_diag_2d
 
-    ord = 'fro'
     diff_a = a - a_blocks
     diff_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
     exact_norm = torch.linalg.matrix_norm(a, ord=ord)
