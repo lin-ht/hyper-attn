@@ -71,13 +71,6 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
         exact_attn2_f32 = exact_attn2.to(torch.float32)
         exact_lse2_f32 = exact_lse2.to(torch.float32)
 
-        attn_hyper = HyperAttention(
-            input_dim=dim,  # config.input_dim == dim
-            block_size=config.block_size,
-            sample_size=config.sample_size,
-            min_seq_len=config.min_seq_len,
-            impl=config.impl).to(device='cuda', dtype=q.dtype)
-
         attn_hyper0 = HyperAttentionOrg(
             input_dim=dim,  # config.input_dim == dim
             block_size=config.block_size,
@@ -85,13 +78,20 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
             min_seq_len=config.min_seq_len,
             impl="cuda").to(device='cuda', dtype=q.dtype)
 
-        rst_attn, rst_lse = attn_hyper(q, k, v, causal=causal, return_lse=True)
-        rst_attn_f32 = rst_attn.to(torch.float32)
-        rst_lse_f32 = rst_lse.to(torch.float32)
+        attn_hyper = HyperAttention(
+            input_dim=dim,  # config.input_dim == dim
+            block_size=config.block_size,
+            sample_size=config.sample_size,
+            min_seq_len=config.min_seq_len,
+            impl=config.impl).to(device='cuda', dtype=q.dtype)
 
         rst_attn0, rst_lse0 = attn_hyper0(q, k, v, causal=causal, return_lse=True)
         rst_attn0_f32 = rst_attn0.to(torch.float32)
         rst_lse0_f32 = rst_lse0.to(torch.float32)
+
+        rst_attn, rst_lse = attn_hyper(q, k, v, causal=causal, return_lse=True)
+        rst_attn_f32 = rst_attn.to(torch.float32)
+        rst_lse_f32 = rst_lse.to(torch.float32)
 
         # Use restricter left side value ||Ax||_p <= ||A||_p * ||x||_p
         # to calculate the spectral error ratio.
