@@ -19,26 +19,31 @@ class HyperAttentionConfig:
         self.min_seq_len = min_seq_len
         self.impl = impl
 
+def random_array(shape, dtype=torch.bfloat16, device="cuda", requires_grad:bool=False):
+    return torch.randn(shape, dtype=dtype, device=device, requires_grad=requires_grad)
+    # return torch.rand(shape, dtype=dtype, device=device, requires_grad=requires_grad) * 2 - 1.0
 
-def get_tensors(batch_size, seq_len, head_size, dim, requires_grad:bool=False, config:HyperAttentionConfig|None=None, noise_scale:float=0.01, permute:bool=True):
-    if config is None:
-        q = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
-        k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
-        v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+def get_tensors(batch_size, seq_len, head_size, dim, requires_grad:bool=False, block_size:int=4, noise_scale:float=0.01, permute:bool=True):
+    if block_size <= 0:
+        q = random_array((batch_size, seq_len, head_size, dim), requires_grad=requires_grad)
+        k = random_array((batch_size, seq_len, head_size, dim), requires_grad=requires_grad)
+        v = random_array((batch_size, seq_len, head_size, dim), requires_grad=requires_grad)
     else:
         start_time = time.time()
-        n_bases = config.block_size
+        n_bases = block_size
         n_blocks = (seq_len + n_bases - 1) // n_bases
         seq_len_sup = n_blocks * n_bases
         n_padding = seq_len_sup - seq_len
-        k_sup = torch.randn((batch_size, seq_len_sup, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        k_sup = random_array((batch_size, seq_len_sup, head_size, dim), requires_grad=requires_grad)
         if n_padding > 0:
             k_sup[:, seq_len:, :, :] = k_sup[:, seq_len-n_padding:seq_len, :, :]
 
-        s = torch.rand((batch_size, seq_len, head_size, n_bases), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        eps = 1e-6
+        s = torch.rand((batch_size, seq_len, head_size, n_bases), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad) + eps
+        # s[:] = 1.0
         s = s / s.sum(dim=-1, keepdim=True)
 
-        q = noise_scale * torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        q = noise_scale * random_array((batch_size, seq_len, head_size, dim), requires_grad=requires_grad)
         k_sup_view = k_sup.view(batch_size, n_blocks, n_bases, head_size, dim)
         for i in range(n_blocks):
             s_block = s[:, i*n_bases:i*n_bases+n_bases, :, :]
@@ -46,7 +51,7 @@ def get_tensors(batch_size, seq_len, head_size, dim, requires_grad:bool=False, c
             q_block = torch.einsum("blhn,bnhd->blhd", s_block, k_sup_view_block)
             q[:, i*n_bases:i*n_bases+n_bases, :, :] += q_block
 
-        v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        v = random_array((batch_size, seq_len, head_size, dim), requires_grad=requires_grad)
         # Apply random permutation:
         if permute:
             k = torch.zeros_like(v)
@@ -62,19 +67,28 @@ def get_tensors(batch_size, seq_len, head_size, dim, requires_grad:bool=False, c
 
     return q, k, v
 
+TEST_HYPER_ATTN_CONFIGS = [
+    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='xformers'),
+    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='cuda'),
+    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='triton'),
+]
 
-def test_get_tensors():
+TEST_CASES = [
+    (4, 8, 8192, 128, False),
+    # (4, 8, 32768, 128, False),
+    # (1, 32, 2**16, 64, False),
+    # (1, 32, 2**16, 64, True),
+]
+
+@pytest.mark.parametrize("block_size", [i.block_size for i in TEST_HYPER_ATTN_CONFIGS])
+@pytest.mark.parametrize(
+    ["batch_size", "head_size", "seq_len", "dim", "causal"], TEST_CASES
+)
+def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len, dim, causal):
     torch.manual_seed(42)
 
-    batch_size = 4
-    head_size = 32
-    seq_len = 128
-    dim = 64
-
-    config = HyperAttentionConfig(input_dim=dim, lsh_num_projs=7, block_size=16, sample_size=16, min_seq_len=32, impl='xformers')
-
-    t_0 = time.time()
-    q, k, v = get_tensors(batch_size, seq_len, head_size, dim, config=config, noise_scale=0, permute=False)
+    co_size = min(block_size, 4)
+    q, k, v = get_tensors(batch_size, seq_len, head_size, dim, block_size=co_size, noise_scale=0, permute=False)
 
     # q.shape = (batch_size, seq_len, head_size, dim)
     q_ = q.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim)
@@ -94,12 +108,12 @@ def test_get_tensors():
     spectral_error_ratio_a_k = diff_a_k_norm / exact_a_k_norm
     max_spectral_error_ratio_ref = spectral_error_ratio_a_k.max().item()
 
-    print(f"a_k[0, 0, 0:{config.block_size}, 0:{config.block_size}] = \n{a_k[0, 0, 0:config.block_size, 0:config.block_size]}")
-    print(f"a_k_diag[0, 0, 0:{config.block_size}, 0:{config.block_size}] = \n{a_k_diag[0, 0, 0:config.block_size, 0:config.block_size]}")
+    print(f"a_k[0, 0, 0:{block_size}, 0:{block_size}] = \n{a_k[0, 0, 0:block_size, 0:block_size]}")
+    print(f"a_k_diag[0, 0, 0:{block_size}, 0:{block_size}] = \n{a_k_diag[0, 0, 0:block_size, 0:block_size]}")
     print(f"For maxtrix a {a.shape}: max_spectral_error_ratio_ref is {max_spectral_error_ratio_ref:.5f}")
 
-    block2d = torch.ones((config.block_size, config.block_size), dtype=torch.bfloat16, device=a.device, requires_grad=False)
-    block2d_list = [block2d for _ in range(seq_len // config.block_size)] + [block2d[:seq_len % config.block_size, :seq_len % config.block_size]]
+    block2d = torch.ones((block_size, block_size), dtype=torch.bfloat16, device=a.device, requires_grad=False)
+    block2d_list = [block2d for _ in range(seq_len // block_size)] + [block2d[:seq_len % block_size, :seq_len % block_size]]
     block_diag_2d = torch.block_diag(*block2d_list).unsqueeze_(0).unsqueeze_(0)
     a_blocks = a * block_diag_2d
 
@@ -109,24 +123,13 @@ def test_get_tensors():
     spectral_error_ratio = diff_norm / exact_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
 
-    print(f"seq_len: {seq_len:<8}, block_size: {config.block_size}, dim: {dim:<8}, ord: {ord}")
-    print(f"a[0, 0, 0:2, 0:{3*config.block_size}] = \n{a[0, 0, 0:2, 0:3*config.block_size]}")
-    print(f"a_blocks[0, 0, 0:2, 0:{3*config.block_size}] = \n{a_blocks[0, 0, 0:2, 0:3*config.block_size]}")
+    print(f"seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
+    print(f"a[0, 0, 0:2, 0:{min(3*block_size, a.shape[-1])}] = \n{a[0, 0, 0:2, 0:min(3*block_size, a.shape[-1])]}")
+    print(f"a_blocks[0, 0, 0:2, 0:{min(3*block_size, a.shape[-1])}] = \n{a_blocks[0, 0, 0:2, 0:min(3*block_size, a.shape[-1])]}")
     print(f"For maxtrix a {a.shape}: max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
     print("End of test_get_tensors")
+    return q, k, v, max_spectral_error_ratio
 
-
-TEST_HYPER_ATTN_CONFIGS = [
-    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=1024, sample_size=1024, min_seq_len=2048, impl='xformers'),
-    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='cuda'),
-    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='triton'),
-]
-
-TEST_CASES = [
-    (4, 8, 32768, 128, False),
-    # (1, 32, 2**16, 64, False),
-    # (1, 32, 2**16, 64, True),
-]
 
 @pytest.mark.parametrize("config", TEST_HYPER_ATTN_CONFIGS)
 @pytest.mark.parametrize(
@@ -145,7 +148,8 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
         print(f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim")
         config.input_dim = dim
 
-    q, k, v = get_tensors(batch_size, head_size, seq_len, dim)
+    co_size = min(config.block_size, 4)
+    q, k, v = get_tensors(batch_size, head_size, seq_len, dim, block_size=co_size, noise_scale=0.01, permute=True)
     print(f"q[0, 0, 0, :] = \n{q[0, 0, 0, :]}")
     print(f"k[0, 0, 0, :] = \n{k[0, 0, 0, :]}")
     print(f"v[0, 0, 0, :] = \n{v[0, 0, 0, :]}")
@@ -222,5 +226,5 @@ def compute_error_ratio(diff_attn, diff_lse, exact_attn, exact_lse, ord='fro', l
 
 if __name__ == "__main__":
     # pytest.main([__file__])
-    test_get_tensors()
-    # test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
+    # test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0].block_size, *(TEST_CASES[0]))
+    test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
