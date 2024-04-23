@@ -1,3 +1,4 @@
+import time
 import torch
 import pytest
 
@@ -9,14 +10,6 @@ from attention.hyper_attn.utils import (
     exact_attention,
 )
 
-
-def get_tensors(batch_size, seq_len, head_size, dim, requires_grad=False):
-    q = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
-    k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
-    v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
-    return q, k, v
-
-
 class HyperAttentionConfig:
     def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='xformers'):
         self.input_dim = input_dim
@@ -26,9 +19,96 @@ class HyperAttentionConfig:
         self.min_seq_len = min_seq_len
         self.impl = impl
 
+
+def get_tensors(batch_size, seq_len, head_size, dim, requires_grad:bool=False, config:HyperAttentionConfig|None=None, noise_scale:float=0.01, permute:bool=True):
+    if config is None:
+        q = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+    else:
+        start_time = time.time()
+        n_bases = config.block_size
+        n_blocks = (seq_len + n_bases - 1) // n_bases
+        seq_len_sup = n_blocks * n_bases
+        n_padding = seq_len_sup - seq_len
+        k_sup = torch.randn((batch_size, seq_len_sup, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        if n_padding > 0:
+            k_sup[:, seq_len:, :, :] = k_sup[:, seq_len-n_padding:seq_len, :, :]
+
+        s = torch.rand((batch_size, seq_len, head_size, n_bases), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        s = s / s.sum(dim=-1, keepdim=True)
+
+        q = noise_scale * torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        k_sup_view = k_sup.view(batch_size, n_blocks, n_bases, head_size, dim)
+        for i in range(n_blocks):
+            s_block = s[:, i*n_bases:i*n_bases+n_bases, :, :]
+            k_sup_view_block = k_sup_view[:, i, :, :, :]
+            q_block = torch.einsum("blhn,bnhd->blhd", s_block, k_sup_view_block)
+            q[:, i*n_bases:i*n_bases+n_bases, :, :] += q_block
+
+        v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        # Apply random permutation:
+        if permute:
+            k = torch.zeros_like(v)
+            for i in range(batch_size):
+                for j in range(head_size):
+                    q[i, :, j, :] = q[i, torch.randperm(seq_len), j, :]
+                    k[i, :, j, :] = k_sup[i, torch.randperm(seq_len), j, :]
+        else:
+            k = k_sup[:, :seq_len, :, :]
+
+        total_time = time.time() - start_time
+        print(f"get_tensors run time: {total_time:.3f} seconds.")
+
+    return q, k, v
+
+
+def test_get_tensors():
+    torch.manual_seed(42)
+
+    batch_size = 4
+    head_size = 32
+    seq_len = 128
+    dim = 64
+
+    config = HyperAttentionConfig(input_dim=dim, lsh_num_projs=7, block_size=16, sample_size=16, min_seq_len=32, impl='xformers')
+
+    t_0 = time.time()
+    q, k, v = get_tensors(batch_size, seq_len, head_size, dim, config=config, noise_scale=0, permute=False)
+
+    # q.shape = (batch_size, seq_len, head_size, dim)
+    q_ = q.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim)
+    k_ = k.permute(0, 2, 3, 1).reshape(batch_size * head_size, dim, seq_len)
+    w_ = torch.bmm(q_, k_) * (dim ** (-0.5))  # (batch_size * head_size, seq_len, seq_len)
+    a = torch.nn.functional.softmax(w_, dim=2).reshape(batch_size, head_size, seq_len, seq_len)
+
+    k_as_q = k.reshape(batch_size * head_size, seq_len, dim)
+    w_k = torch.bmm(k_as_q, k_) * (dim ** (-0.5))
+    a_k = torch.nn.functional.softmax(w_k, dim=2).reshape(batch_size, head_size, seq_len, seq_len)
+    print(f"a_k[0, 0, 0:{config.block_size}, 0:{config.block_size}] = \n{a_k[0, 0, 0:config.block_size, 0:config.block_size]}")
+
+    block2d = torch.ones((config.block_size, config.block_size), dtype=torch.bfloat16, device=a.device, requires_grad=False)
+    block2d_list = [block2d for _ in range(seq_len // config.block_size)] + [block2d[:seq_len % config.block_size, :seq_len % config.block_size]]
+    block_diag_2d = torch.block_diag(*block2d_list).unsqueeze_(0).unsqueeze_(0)
+    a_blocks = a * block_diag_2d
+
+    ord = 'fro'
+    diff_a = a - a_blocks
+    diff_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
+    exact_norm = torch.linalg.matrix_norm(a, ord=ord)
+    spectral_error_ratio = diff_norm / exact_norm
+    max_spectral_error_ratio = spectral_error_ratio.max().item()
+
+    print(f"seq_len: {seq_len:<8}, block_size: {config.block_size}, dim: {dim:<8}, ord: {ord}")
+    print(f"a[0, 0, 0:2, 0:{3*config.block_size}] = \n{a[0, 0, 0:2, 0:3*config.block_size]}")
+    print(f"a_blocks[0, 0, 0:2, 0:{3*config.block_size}] = \n{a_blocks[0, 0, 0:2, 0:3*config.block_size]}")
+    print(f"For maxtrix a {a.shape}: max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+    print("End of test_get_tensors")
+
+
 TEST_HYPER_ATTN_CONFIGS = [
-    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='xformers'),
-    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='cuda'),
+    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=1024, sample_size=1024, min_seq_len=2048, impl='xformers'),
+    # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='cuda'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='triton'),
 ]
 
@@ -132,4 +212,5 @@ def compute_error_ratio(diff_attn, diff_lse, exact_attn, exact_lse, ord='fro', l
 
 if __name__ == "__main__":
     # pytest.main([__file__])
-    test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
+    test_get_tensors()
+    # test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
