@@ -95,6 +95,13 @@ def exact_attention_cuda(query, key, value, softmax_scale, causal=False, bias=No
     return out, lse
 
 def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bias=None):
+    # HyperAttn input format: BHMK
+    # In contrast: xformers dim format: BMK, BMHK, BMGHK
+    # B = batch size
+    # M = sequence length
+    # G = heads groups (in case of multiquery/grouped query attention)
+    # H = heads per group
+    # K = embedding size per head
     out, lse = flash_attn_func_xformers(
         query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
         bias, causal, softmax_scale)
