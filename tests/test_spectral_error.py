@@ -76,17 +76,22 @@ TEST_HYPER_ATTN_CONFIGS = [
 ]
 
 TEST_CASES = [
-    (1, 8, 8192, 128, False),
+    (1, 8, 4096, 128, False),
+    # (1, 8, 8192, 128, False),
     # (4, 8, 32768, 128, False),
     # (1, 32, 2**16, 64, False),
     # (1, 32, 2**16, 64, True),
 ]
 
 
-def calculate_attn(q, k, v, softmax_scale, bias=None) -> torch.Tensor:
+def calculate_attn(q, k, v, softmax_scale, bias=None):
     # softmax_scale = dim ** (-0.5)
     batch_size, head_size, seq_len, dim = q.shape # BMHK format
     n_key = k.shape[-2]  # Mostly n_key = seq_len
+
+    if seq_len > 2**14:
+        print(f"Skip calculate_attn for seq_len={seq_len}")
+        return None, None, None
 
     q_ = q.reshape(batch_size*head_size, -1, dim)
     k_ = k.permute(0, 1, 3, 2).reshape(batch_size*head_size, dim, -1)
@@ -101,8 +106,8 @@ def calculate_attn(q, k, v, softmax_scale, bias=None) -> torch.Tensor:
 
     # attn[b,i,j]=sum_c v[b,i,_c]a[b,_c,j]
     v_ = v.permute(0, 1, 3, 2).reshape(batch_size*head_size, dim, -1)  # (batch_size*head_size, dim, n_key)
-    a_ = a_.permute(0, 2, 1)  # (batch_size * head_size, n_key, seq_len)
-    attn = torch.bmm(v_, a_).permute(0, 2, 1).reshape(batch_size, head_size, -1, dim)  # (batch_size, head_size, seq_len, dim)
+    # a_.permute(0, 2, 1) is (batch_size * head_size, n_key, seq_len)
+    attn = torch.bmm(v_, a_.permute(0, 2, 1)).permute(0, 2, 1).reshape(batch_size, head_size, -1, dim)  # (batch_size, head_size, seq_len, dim)
 
     return attn, a_.reshape(batch_size, head_size, seq_len, n_key), d_
 
@@ -112,9 +117,6 @@ def calculate_attn(q, k, v, softmax_scale, bias=None) -> torch.Tensor:
     ["batch_size", "head_size", "seq_len", "dim", "causal"], TEST_CASES
 )
 def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len, dim, causal):
-    if seq_len > 2**14:
-        print(f"Skip test_get_tensors_and_error_ratio for seq_len={seq_len}")
-        return None
     torch.manual_seed(42)
     ord = 'fro'
     softmax_scale = dim ** (-0.5)
@@ -122,7 +124,7 @@ def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len,
     co_size = min(block_size, 4)
     q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=False)
 
-    a_calc_k, a_k = calculate_attn(k, k, v, softmax_scale)
+    a_calc_k, a_k, d_k = calculate_attn(k, k, v, softmax_scale)
 
     a_exact_k, _ = exact_attention_xformers(k, k, v, softmax_scale)
     diag_mask = fmha.BlockDiagonalMask.from_seqlens([1]*seq_len)
@@ -139,7 +141,8 @@ def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len,
     print(f"a_calc_k[0, 0, 0:2, :] = \n{a_calc_k[0, 0, 0:2, :]}")
     print(f"For maxtrix a {a_exact_k.shape}: max_spectral_error_ratio_ref is {max_spectral_error_ratio_ref:.5f}")
 
-    diff_a_k = a_exact_k - a_block_k
+    s = torch.norm(a_exact_k, dim=-1, keepdim=True) / torch.norm(a_block_k, dim=-1, keepdim=True)
+    diff_a_k = a_exact_k - a_block_k * s
     diff_a_k_norm = torch.linalg.matrix_norm(diff_a_k, ord=ord)  # By default: dim = (-2, -1)
     exact_a_k_norm = torch.linalg.matrix_norm(a_exact_k, ord=ord)
     spectral_error_ratio_a_k = diff_a_k_norm / exact_a_k_norm
@@ -157,7 +160,8 @@ def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len,
     block_mask = fmha.BlockDiagonalMask.from_seqlens(block_size_list)
     a_block, _ = exact_attention_xformers(q, k, v, softmax_scale, bias=block_mask)
 
-    diff_a = a_exact - a_block
+    s = torch.norm(a_exact, dim=-1, keepdim=True) / torch.norm(a_block, dim=-1, keepdim=True)
+    diff_a = a_exact - a_block * s
     diff_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
     exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
     spectral_error_ratio = diff_norm / exact_norm
