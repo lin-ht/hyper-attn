@@ -70,7 +70,7 @@ def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, b
     return q, k, v
 
 TEST_HYPER_ATTN_CONFIGS = [
-    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='xformers'),
+    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=1024, min_seq_len=2048, impl='xformers'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='cuda'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, impl='triton'),
 ]
@@ -121,6 +121,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     a_exact, _ = exact_attention_xformers(q, k, v, softmax_scale)
     a_exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
+    a_exact_std, a_exact_m = torch.std_mean(a_exact.reshape(-1), dim=0)
 
     block_size_list = [block_size] * (seq_len // block_size)
     if seq_len % block_size > 0:
@@ -137,25 +138,30 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     print(f"{log_prefix}\ncompare_attn: seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
     print(f"{a_exact.shape}\na_exact[0, 0, 0:2, :] = \n{a_exact[0, 0, 0:2, :]}")
+    print(f"Its data stats are (mean:{a_exact_m.item()}, std:{a_exact_std.item()})\n")
 
     if a_calc is not None:
         diff = a_exact - a_calc
         diff_norm = torch.linalg.matrix_norm(diff, ord=ord)
         spectral_error_ratio = diff_norm / a_exact_norm
         max_spectral_error_ratio = spectral_error_ratio.max().item()
+        diff_std, diff_m = torch.std_mean(diff.reshape(-1), dim=0)
         print(f"a_calc[0, 0, 0:2, :] = \n{a_calc[0, 0, 0:2, :]}")
         print("------------ a_calc ------------")
-        print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}\n")
+        print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+        print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n")
 
     s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_block, dim=-1, keepdim=True) + 1e-6)
     diff_a = a_exact - a_block * s
     diff_a_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
     spectral_error_ratio = diff_a_norm / a_exact_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
+    diff_std, diff_m = torch.std_mean(diff_a.reshape(-1), dim=0)
     print(f"a_block[0, 0, 0:2, :] = \n{a_block[0, 0, 0:2, :]}")
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_block ------------")
-    print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}\n")
+    print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+    print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n")
 
     if config.input_dim != dim:
         print(f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim")
@@ -170,14 +176,16 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     a_hyper, lse_hyper = attn_hyper(q, k, v, causal=False, return_lse=True)
     s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_hyper, dim=-1, keepdim=True) + 1e-6)
-    diff_a = a_exact - a_hyper * s
+    diff_a = a_exact - a_hyper # * s
     diff_a_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
     spectral_error_ratio = diff_a_norm / a_exact_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
+    diff_std, diff_m = torch.std_mean(diff_a.reshape(-1), dim=0)
     print(f"a_hyper[0, 0, 0:2, :] = \n{a_hyper[0, 0, 0:2, :]}")
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_hyper ------------")
-    print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}\n\n")
+    print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+    print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n\n")
 
     return a_exact, a_block, max_spectral_error_ratio
 
