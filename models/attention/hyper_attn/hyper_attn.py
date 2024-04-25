@@ -180,16 +180,19 @@ class HyperAttention(torch.nn.Module):
                     block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
                     block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
                     block_mask = block_mask.to(query_sorted.dtype)
+                    block_mask_cnt = block_mask.sum(dim=-1, keepdim=True)
                     block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf to QK^T to mask out
                 else:
+                    block_mask_cnt = torch.zeros(1)
                     block_mask = None
 
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
+                block_mask_cnt = torch.zeros(1)
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
 
-            weights = (n_key - max(0, key_block_size)) / sample_size
-            lse_res = lse_res + math.log(weights)
+            weights = torch.clamp((n_key - block_mask_cnt) / sample_size, min=1.0) # weights >= 1.0
+            lse_res = lse_res + torch.log(weights)
 
             # Add two attentions
             if key_block_size > 0:
