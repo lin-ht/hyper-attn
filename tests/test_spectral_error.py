@@ -111,7 +111,8 @@ def calculate_attn(q, k, v, softmax_scale, bias=None):
     return attn, a_.reshape(batch_size, head_size, seq_len, n_key), d_
 
 
-def compare_attn(q, k, v, softmax_scale, block_size, ord="fro", do_calculation = False, log_prefix=""):
+def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = False, log_prefix=""):
+    block_size = config.block_size
     batch_size, head_size, seq_len, dim = q.shape # BMHK format
     n_key = k.shape[-2]  # Mostly n_key = seq_len
 
@@ -120,7 +121,6 @@ def compare_attn(q, k, v, softmax_scale, block_size, ord="fro", do_calculation =
 
     a_exact, _ = exact_attention_xformers(q, k, v, softmax_scale)
     a_exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
-
 
     block_size_list = [block_size] * (seq_len // block_size)
     if seq_len % block_size > 0:
@@ -133,6 +133,7 @@ def compare_attn(q, k, v, softmax_scale, block_size, ord="fro", do_calculation =
     v_ = v.reshape(1, batch_size*head_size, -1, dim)
 
     a_block, _ = exact_attention_xformers(q_, k_, v_, softmax_scale, bias=block_mask)
+    a_block = a_block.reshape(batch_size, head_size, seq_len, dim)
 
     print(f"{log_prefix}\ncompare_attn: seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
     print(f"{a_exact.shape}\na_exact[0, 0, 0:2, :] = \n{a_exact[0, 0, 0:2, :]}")
@@ -143,7 +144,7 @@ def compare_attn(q, k, v, softmax_scale, block_size, ord="fro", do_calculation =
         spectral_error_ratio = diff_norm / a_exact_norm
         max_spectral_error_ratio = spectral_error_ratio.max().item()
         print(f"a_calc[0, 0, 0:2, :] = \n{a_calc[0, 0, 0:2, :]}")
-        print("------------")
+        print("------------ a_calc ------------")
         print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
 
     s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_block, dim=-1, keepdim=True) + 1e-6)
@@ -152,26 +153,50 @@ def compare_attn(q, k, v, softmax_scale, block_size, ord="fro", do_calculation =
     spectral_error_ratio = diff_a_norm / a_exact_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
     print(f"a_block[0, 0, 0:2, :] = \n{a_block[0, 0, 0:2, :]}")
-    print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :]}")
-    print("------------")
+    print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
+    print("------------ a_block ------------")
     print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+
+
+    if config.input_dim != dim:
+        print(f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim")
+        config.input_dim = dim
+
+    attn_hyper = HyperAttention(
+        input_dim=dim,  # config.input_dim == dim
+        block_size=config.block_size,
+        sample_size=config.sample_size,
+        min_seq_len=config.min_seq_len,
+        impl=config.impl).to(device='cuda', dtype=q.dtype)
+
+    a_hyper, lse_hyper = attn_hyper(q, k, v, causal=False, return_lse=True)
+    s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_hyper, dim=-1, keepdim=True) + 1e-6)
+    diff_a = a_exact - a_hyper * s
+    diff_a_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
+    spectral_error_ratio = diff_a_norm / a_exact_norm
+    max_spectral_error_ratio = spectral_error_ratio.max().item()
+    print(f"a_hyper[0, 0, 0:2, :] = \n{a_hyper[0, 0, 0:2, :]}")
+    print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
+    print("------------ a_hyper ------------")
+    print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+
     return a_exact, a_block, max_spectral_error_ratio
 
 
-@pytest.mark.parametrize("block_size", [i.block_size for i in TEST_HYPER_ATTN_CONFIGS])
+@pytest.mark.parametrize("config", TEST_HYPER_ATTN_CONFIGS)
 @pytest.mark.parametrize(
     ["batch_size", "head_size", "seq_len", "dim", "causal"], TEST_CASES
 )
-def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len, dim, causal):
+def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim, causal):
     torch.manual_seed(42)
     ord = 'fro'
     softmax_scale = dim ** (-0.5)
 
-    co_size = min(block_size, 4)
+    co_size = min(config.block_size, 4)
     q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=False)
 
-    compare_attn(k, k, v, softmax_scale, block_size, do_calculation = True, log_prefix="Compare results with input k, k, v: ")
-    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, block_size, do_calculation = True, log_prefix="Compare results with input q, k, v: ")
+    compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix="Compare results with input k, k, v: ")
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix="Compare results with input q, k, v: ")
     return q, k, v, max_spectral_error_ratio
 
 
@@ -270,5 +295,5 @@ def compute_error_ratio(diff_attn, diff_lse, exact_attn, exact_lse, ord='fro', l
 
 if __name__ == "__main__":
     # pytest.main([__file__])
-    test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0].block_size, *(TEST_CASES[0]))
+    test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
     # test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
