@@ -85,7 +85,6 @@ TEST_CASES = [
 
 
 def calculate_attn(q, k, v, softmax_scale, bias=None):
-    # softmax_scale = dim ** (-0.5)
     batch_size, head_size, seq_len, dim = q.shape # BMHK format
     n_key = k.shape[-2]  # Mostly n_key = seq_len
 
@@ -112,6 +111,53 @@ def calculate_attn(q, k, v, softmax_scale, bias=None):
     return attn, a_.reshape(batch_size, head_size, seq_len, n_key), d_
 
 
+def compare_attn(q, k, v, softmax_scale, block_size, ord="fro", do_calculation = False, log_prefix=""):
+    batch_size, head_size, seq_len, dim = q.shape # BMHK format
+    n_key = k.shape[-2]  # Mostly n_key = seq_len
+
+    if do_calculation:
+        a_calc, a, d = calculate_attn(q, k, v, softmax_scale)
+
+    a_exact, _ = exact_attention_xformers(q, k, v, softmax_scale)
+    a_exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
+
+
+    block_size_list = [block_size] * (seq_len // block_size)
+    if seq_len % block_size > 0:
+        block_size_list.append(seq_len % block_size)
+    block_mask = fmha.BlockDiagonalMask.from_seqlens(block_size_list)
+
+    # Batch size is required to be 1 when applying block_mask in xformers.
+    q_ = q.reshape(1, batch_size*head_size, -1, dim)
+    k_ = k.reshape(1, batch_size*head_size, -1, dim)
+    v_ = v.reshape(1, batch_size*head_size, -1, dim)
+
+    a_block, _ = exact_attention_xformers(q_, k_, v_, softmax_scale, bias=block_mask)
+
+    print(f"{log_prefix}\ncompare_attn: seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
+    print(f"{a_exact.shape}\na_exact[0, 0, 0:2, :] = \n{a_exact[0, 0, 0:2, :]}")
+
+    if a_calc is not None:
+        diff = a_exact - a_calc
+        diff_norm = torch.linalg.matrix_norm(diff, ord=ord)
+        spectral_error_ratio = diff_norm / a_exact_norm
+        max_spectral_error_ratio = spectral_error_ratio.max().item()
+        print(f"a_calc[0, 0, 0:2, :] = \n{a_calc[0, 0, 0:2, :]}")
+        print("------------")
+        print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+
+    s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_block, dim=-1, keepdim=True) + 1e-6)
+    diff_a = a_exact - a_block * s
+    diff_a_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
+    spectral_error_ratio = diff_a_norm / a_exact_norm
+    max_spectral_error_ratio = spectral_error_ratio.max().item()
+    print(f"a_block[0, 0, 0:2, :] = \n{a_block[0, 0, 0:2, :]}")
+    print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :]}")
+    print("------------")
+    print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+    return a_exact, a_block, max_spectral_error_ratio
+
+
 @pytest.mark.parametrize("block_size", [i.block_size for i in TEST_HYPER_ATTN_CONFIGS])
 @pytest.mark.parametrize(
     ["batch_size", "head_size", "seq_len", "dim", "causal"], TEST_CASES
@@ -124,54 +170,8 @@ def test_get_tensors_and_error_ratio(block_size, batch_size, head_size, seq_len,
     co_size = min(block_size, 4)
     q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=False)
 
-    a_calc_k, a_k, d_k = calculate_attn(k, k, v, softmax_scale)
-
-    a_exact_k, _ = exact_attention_xformers(k, k, v, softmax_scale)
-    diag_mask = fmha.BlockDiagonalMask.from_seqlens([1]*seq_len)
-    a_block_k, _ = exact_attention_xformers(k, k, v, softmax_scale, bias=diag_mask)
-
-    diff_a_k = a_exact_k - a_calc_k
-    diff_a_k_norm = torch.linalg.matrix_norm(diff_a_k, ord=ord)  # By default: dim = (-2, -1)
-    exact_a_k_norm = torch.linalg.matrix_norm(a_exact_k, ord=ord)
-    spectral_error_ratio_a_k = diff_a_k_norm / exact_a_k_norm
-    max_spectral_error_ratio_ref = spectral_error_ratio_a_k.max().item()
-
-    print(f"v[0, 0, 0:2, :] = \n{v[0, 0, 0:2, :]}")
-    print(f"a_exact_k[0, 0, 0:2, :] = \n{a_exact_k[0, 0, 0:2, :]}")
-    print(f"a_calc_k[0, 0, 0:2, :] = \n{a_calc_k[0, 0, 0:2, :]}")
-    print(f"For maxtrix a {a_exact_k.shape}: max_spectral_error_ratio_ref is {max_spectral_error_ratio_ref:.5f}")
-
-    s = torch.norm(a_exact_k, dim=-1, keepdim=True) / torch.norm(a_block_k, dim=-1, keepdim=True)
-    diff_a_k = a_exact_k - a_block_k * s
-    diff_a_k_norm = torch.linalg.matrix_norm(diff_a_k, ord=ord)  # By default: dim = (-2, -1)
-    exact_a_k_norm = torch.linalg.matrix_norm(a_exact_k, ord=ord)
-    spectral_error_ratio_a_k = diff_a_k_norm / exact_a_k_norm
-    max_spectral_error_ratio_ref = spectral_error_ratio_a_k.max().item()
-
-    # print(f"v[0, 0, 0:2, :] = \n{v[0, 0, 0:2, :]}")
-    # print(f"a_exact_k[0, 0, 0:2, :] = \n{a_exact_k[0, 0, 0:2, :]}")
-    print(f"a_block_k[0, 0, 0:2, :] = \n{a_block_k[0, 0, 0:2, :]}")
-    print(f"For maxtrix a {a_exact_k.shape}: max_spectral_error_ratio_ref is {max_spectral_error_ratio_ref:.5f}")
-
-    a_exact, _ = exact_attention_xformers(q, k, v, softmax_scale)
-    block_size_list = [block_size] * (seq_len // block_size)
-    if seq_len % block_size > 0:
-        block_size_list.append(seq_len % block_size)
-    block_mask = fmha.BlockDiagonalMask.from_seqlens(block_size_list)
-    a_block, _ = exact_attention_xformers(q, k, v, softmax_scale, bias=block_mask)
-
-    s = torch.norm(a_exact, dim=-1, keepdim=True) / torch.norm(a_block, dim=-1, keepdim=True)
-    diff_a = a_exact - a_block * s
-    diff_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
-    exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
-    spectral_error_ratio = diff_norm / exact_norm
-    max_spectral_error_ratio = spectral_error_ratio.max().item()
-
-    print(f"seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
-    print(f"a_exact[0, 0, 0:2, :] = \n{a_exact[0, 0, 0:2, :]}")
-    print(f"a_block[0, 0, 0:2, :] = \n{a_block[0, 0, 0:2, :]}")
-    print(f"For maxtrix a {a_exact.shape}: max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
-    print("End of test_get_tensors")
+    compare_attn(k, k, v, softmax_scale, block_size, do_calculation = True, log_prefix="Compare results with input k, k, v: ")
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, block_size, do_calculation = True, log_prefix="Compare results with input q, k, v: ")
     return q, k, v, max_spectral_error_ratio
 
 
