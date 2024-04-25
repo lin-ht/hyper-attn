@@ -145,7 +145,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
         max_spectral_error_ratio = spectral_error_ratio.max().item()
         print(f"a_calc[0, 0, 0:2, :] = \n{a_calc[0, 0, 0:2, :]}")
         print("------------ a_calc ------------")
-        print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+        print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}\n")
 
     s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_block, dim=-1, keepdim=True) + 1e-6)
     diff_a = a_exact - a_block * s
@@ -155,8 +155,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
     print(f"a_block[0, 0, 0:2, :] = \n{a_block[0, 0, 0:2, :]}")
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_block ------------")
-    print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
-
+    print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}\n")
 
     if config.input_dim != dim:
         print(f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim")
@@ -178,7 +177,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
     print(f"a_hyper[0, 0, 0:2, :] = \n{a_hyper[0, 0, 0:2, :]}")
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_hyper ------------")
-    print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
+    print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}\n\n")
 
     return a_exact, a_block, max_spectral_error_ratio
 

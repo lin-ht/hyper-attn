@@ -132,6 +132,7 @@ class HyperAttention(torch.nn.Module):
             key_split_per_block = key_sorted.view(-1, 1, key_block_size, dim)
             value_split_per_block = value_sorted.view(-1, 1, key_block_size, dim)
 
+            # This attn_block = (D^{-1}A)(V) and the D^{-1}A does softmax locally according to the block.
             attn_block, lse_block = self.exact_attn(
                 query_split_per_block, key_split_per_block, value_split_per_block,
                 softmax_scale=scale, causal=False)
@@ -163,24 +164,31 @@ class HyperAttention(torch.nn.Module):
         # Sample indices uniformly at random
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > query_block_size) and (n_key > key_block_size):
-            sampled_set = torch.randint(n_key, size=(batch_size, head_size, sample_size), device=query_sorted.device)
+            # sampled_set = torch.randint(n_key, size=(batch_size, head_size, sample_size), device=query_sorted.device)
+            # Hack to have same probability for each key column
+            sample_prob = torch.ones(1, device=query_sorted.device)
+            sample_prob.as_strided_((batch_size * head_size, n_key), (0, 0))
+            sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
             value_subset = indexing(value_sorted, sampled_set)
             key_subset = indexing(key_sorted, sampled_set)
-            weights = n_key / sample_size
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
             offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
             if self.impl != "cuda":
-                # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
-                block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
-                block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
-                block_mask = block_mask.to(query_sorted.dtype)
-                block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf added to QK^T
+                if key_block_size > 0:
+                    # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
+                    block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
+                    block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
+                    block_mask = block_mask.to(query_sorted.dtype)
+                    block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf to QK^T to mask out
+                else:
+                    block_mask = None
 
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
 
+            weights = (n_key - max(0, key_block_size)) / sample_size
             lse_res = lse_res + math.log(weights)
 
             # Add two attentions
