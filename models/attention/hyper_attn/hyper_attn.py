@@ -180,40 +180,66 @@ class HyperAttention(torch.nn.Module):
                     block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
                     block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
                     block_mask = block_mask.to(query_sorted.dtype)
-                    block_mask_cnt = block_mask.sum(dim=-1, keepdim=True)
+                    sampled_cnt =  sample_size - block_mask.sum(dim=-1, keepdim=True)
                     block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf to QK^T to mask out
                 else:
-                    block_mask_cnt = torch.zeros(1)
+                    sampled_cnt = torch.ones(1) * sample_size
                     block_mask = None
 
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
-                block_mask_cnt = torch.zeros(1)
+                sampled_cnt = torch.ones(1) * sample_size
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
 
-            weights = torch.clamp((n_key - block_mask_cnt) / sample_size, min=1.0) # weights >= 1.0
-
-            # Add two attentions
+            # Add only sampled residual attentions:
             if key_block_size > 0:
-                unseen_estimation_type = 1
-                if unseen_estimation_type == 0:
-                    # Don't add any sampled residual attentions:
-                    lse_res = lse_res + torch.log(weights)
-                    attn, lse = add_self_attentions(attn_block, lse_block, 0.0, lse_res)
-                elif unseen_estimation_type == 1:
-                    # Add only sampled residual attentions:
-                    attn_, lse_ = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
-                    # Treat the unseen part as zero attentions,
-                    # i.e. assuming the mean of the rest of residual attentions is zero.
-                    lse_res = lse_res + torch.log(weights - 1.0)
-                    attn, lse = add_self_attentions(attn_, lse_, 0.0, lse_res)
-                else:
-                    # Approximate unseen residual attentions from sampled ones:
-                    lse_res = lse_res + torch.log(weights)
-                    attn, lse = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
+                attn_, lse_ = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
             else:
-                lse_res = lse_res + torch.log(weights)
-                attn, lse = attn_res, lse_res
+                attn_, lse_ = attn_res, lse_res
+
+        # 3. Significant sampling according to Value
+            value_norms = torch.norm(value_sorted, dim=-1)
+            _, topk_sampled_set = torch.topk(value_norms, self.sample_size, dim=-1, largest=True, sorted=False)
+            topk_sampled_set.reshape(batch_size, head_size, sample_size)
+            value_subset = indexing(value_sorted, topk_sampled_set)
+            key_subset = indexing(key_sorted, topk_sampled_set)
+
+            # Compute mask for hiding A_ij computed in block-diagonal attention and previously sampled attentions
+            # offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
+            if self.impl != "cuda":
+                if key_block_size > 0:
+                    # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
+                    sampled_set = sampled_set.view(-1, 1, sample_size)
+                    topk_sampled_set = topk_sampled_set.view(-1, 1, sample_size)
+                    topk_block_mask = (offset_n // query_block_size) == (topk_sampled_set // key_block_size)
+                    for i in range(topk_block_mask.shape[0]):
+                        double_sampled = torch.isin(topk_sampled_set[i, 0, :], sampled_set[i, 0, :], assume_unique=True).view(1, 1, sample_size)
+                        topk_block_mask[i, :, :] = topk_block_mask[i, :, :] | double_sampled
+                    topk_block_mask = topk_block_mask.view(batch_size, head_size, -1, sample_size)
+                    topk_block_mask = topk_block_mask.to(query_sorted.dtype)
+                    topk_sampled_cnt = sample_size - topk_block_mask.sum(dim=-1, keepdim=True)
+                    topk_block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf to QK^T to mask out
+                else:
+                    topk_sampled_cnt = torch.ones(1) * sample_size
+                    topk_block_mask = None
+
+                topk_attn_res, topk_lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=topk_block_mask)
+            else:
+                topk_sampled_cnt = torch.ones(1) * sample_size
+                topk_attn_res, topk_lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
+
+            # Add only topk sampled residual attentions:
+            attn_, lse_ = add_self_attentions(attn_, lse_, topk_attn_res, topk_lse_res)
+
+            # Unseen part
+            unseen_estimation_type = 0
+            weights = torch.clamp((n_key - sampled_cnt - topk_sampled_cnt - key_block_size) / (sampled_cnt + 1e-6), min=0.0) # weights >= 0.0
+            lse_res_unseen = lse_res + torch.log(weights)
+            # Treat the unseen part as zero attentions if unseen_estimation_type is 0,
+            # i.e. assuming the mean of the rest of residual attentions is zero.
+            attn_res_unseen = 0 if unseen_estimation_type==0 else attn_res
+            # Add the approximated unseen residual attentions from uniformly sampled ones:
+            attn, lse = add_self_attentions(attn_, lse_, attn_res_unseen, lse_res_unseen)
         else:
             # Only one block, no approximation
             attn, lse = attn_block, lse_block
