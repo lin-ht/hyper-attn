@@ -212,9 +212,10 @@ class HyperAttention(torch.nn.Module):
                     sampled_set = sampled_set.view(-1, 1, sample_size)
                     topk_sampled_set = topk_sampled_set.view(-1, 1, sample_size)
                     topk_block_mask = (offset_n // query_block_size) == (topk_sampled_set // key_block_size)
+                    double_sampled = torch.zeros_like(topk_sampled_set, dtype=torch.bool)
                     for i in range(topk_block_mask.shape[0]):
-                        double_sampled = torch.isin(topk_sampled_set[i, 0, :], sampled_set[i, 0, :], assume_unique=True).view(1, 1, sample_size)
-                        topk_block_mask[i, :, :] = topk_block_mask[i, :, :] | double_sampled
+                        double_sampled[i, 0, :] = torch.isin(topk_sampled_set[i, 0, :], sampled_set[i, 0, :], assume_unique=True).view(1, 1, sample_size)
+                    topk_block_mask = topk_block_mask | double_sampled
                     topk_block_mask = topk_block_mask.view(batch_size, head_size, -1, sample_size)
                     topk_block_mask = topk_block_mask.to(query_sorted.dtype)
                     topk_sampled_cnt = sample_size - topk_block_mask.sum(dim=-1, keepdim=True)
