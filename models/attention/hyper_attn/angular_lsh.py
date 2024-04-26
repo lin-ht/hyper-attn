@@ -56,7 +56,7 @@ class AngularLSH(torch.nn.Module):
         # Random index for our testing case.
         # bin_ids = torch.randint(2 ** self.num_projs, size=bin_ids.shape, device=bin_ids.device)
         # Ground truth index for our testing case.
-        return torch.arange(mat.shape[-2], device=bin_ids.device).repeat(mat.shape[0], mat.shape[1], 1)
+        # return torch.arange(mat.shape[-2], device=bin_ids.device).repeat(mat.shape[0], mat.shape[1], 1)
         return self.perm[bin_ids]  # map hamming code to hash index (in angular order)
 
     def __repr__(self):

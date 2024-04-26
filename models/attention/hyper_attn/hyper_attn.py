@@ -14,7 +14,7 @@ from attention.hyper_attn.angular_lsh import AngularLSH
 
 class HyperAttention(torch.nn.Module):
 
-    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, impl='xformers'):
+    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, approximate_unsampled=True, impl='xformers'):
         """
         Hyperbolic attention module.
         Input parameters:
@@ -23,6 +23,7 @@ class HyperAttention(torch.nn.Module):
             - block_size: int, the block size for block-diagonal approximation
             - sample_size: int, the number of sampled columns in the attention matrix A
             - min_seq_len: int, the minimum sequence length the hyper_attn is applied to
+            - approximate_unsampled: bool, whether to approximate the unseen part of the attention matrix from uniformly sampled ones
             - impl: str, the implementation of the exact attention
         """
         super().__init__()
@@ -32,6 +33,7 @@ class HyperAttention(torch.nn.Module):
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
         self.impl = impl
+        self.approximate_unsampled = approximate_unsampled
         self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
 
         if impl == 'xformers':
@@ -232,13 +234,12 @@ class HyperAttention(torch.nn.Module):
             # Add only topk sampled residual attentions:
             attn_, lse_ = add_self_attentions(attn_, lse_, topk_attn_res, topk_lse_res)
 
-            # Unseen part
-            unseen_estimation_type = 0
+            # Unseen part approximation
             weights = torch.clamp((n_key - sampled_cnt - topk_sampled_cnt - key_block_size) / (sampled_cnt + 1e-6), min=0.0) # weights >= 0.0
             lse_res_unseen = lse_res + torch.log(weights)
             # Treat the unseen part as zero attentions if unseen_estimation_type is 0,
             # i.e. assuming the mean of the rest of residual attentions is zero.
-            attn_res_unseen = 0 if unseen_estimation_type==0 else attn_res
+            attn_res_unseen = attn_res if self.approximate_unsampled else 0
             # Add the approximated unseen residual attentions from uniformly sampled ones:
             attn, lse = add_self_attentions(attn_, lse_, attn_res_unseen, lse_res_unseen)
         else:
