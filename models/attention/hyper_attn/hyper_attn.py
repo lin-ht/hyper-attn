@@ -166,16 +166,15 @@ class HyperAttention(torch.nn.Module):
         # Sample indices uniformly at random
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > query_block_size) and (n_key > key_block_size):
-            # sampled_set = torch.randint(n_key, size=(batch_size, head_size, sample_size), device=query_sorted.device)
             # Hack to have same probability for each key column
-            sample_prob = torch.ones(1, device=query_sorted.device)
-            sample_prob.as_strided_((batch_size * head_size, n_key), (0, 0))
+            sample_prob = torch.ones(1, device=query_sorted.device).as_strided_((batch_size * head_size, n_key), (0, 0))
             sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
             value_subset = indexing(value_sorted, sampled_set)
             key_subset = indexing(key_sorted, sampled_set)
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
-            offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
+            # offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
+            offset_n = torch.arange(n_query, device=query_sorted.device).reshape(1, -1, 1)
             if self.impl != "cuda":
                 if key_block_size > 0:
                     # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
@@ -207,7 +206,6 @@ class HyperAttention(torch.nn.Module):
             key_subset = indexing(key_sorted, topk_sampled_set)
 
             # Compute mask for hiding A_ij computed in block-diagonal attention and previously sampled attentions
-            # offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
             if self.impl != "cuda":
                 if key_block_size > 0:
                     # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
