@@ -14,6 +14,7 @@ class AngularLSH(torch.nn.Module):
             # perm is the angular hamming code sequence arranged in order
             # self.register_buffer('perm', self._unit_hamming_distance_array(self.num_projs), persistent=False)
             self.register_buffer('perm', self._hamming_code_to_order_mapping_perm(self.num_projs), persistent=False)
+            # self.register_buffer('perm', torch.randperm(2 ** num_projs), persistent=False)
             # Example: num_projs=4, enc_vec=[[[[1, 2, 4, 8]]]]
             self.register_buffer('enc_vec', 2 ** torch.arange(self.num_projs).view(1, 1, 1, -1), persistent=False)
 
@@ -52,6 +53,10 @@ class AngularLSH(torch.nn.Module):
         mask = torch.einsum('...nd,...dr -> ...nr', mat, self.proj_dir)
         mask = mask > 0  # mask is the hamming code in binary form
         bin_ids = (mask * self.enc_vec).sum(-1)  # bin_ids is the hamming code in integer form
+        # Random index for our testing case.
+        # bin_ids = torch.randint(2 ** self.num_projs, size=bin_ids.shape, device=bin_ids.device)
+        # Ground truth index for our testing case.
+        return torch.arange(mat.shape[-2], device=bin_ids.device).repeat(mat.shape[0], mat.shape[1], 1)
         return self.perm[bin_ids]  # map hamming code to hash index (in angular order)
 
     def __repr__(self):

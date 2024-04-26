@@ -138,7 +138,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     print(f"{log_prefix}\ncompare_attn: seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
     print(f"{a_exact.shape}\na_exact[0, 0, 0:2, :] = \n{a_exact[0, 0, 0:2, :]}")
-    print(f"Its data stats are (mean:{a_exact_m.item()}, std:{a_exact_std.item()})\n")
+    print(f"Its exact data stats are (mean:{a_exact_m.item():.5f}, std:{a_exact_std.item():.5f})\n")
 
     if a_calc is not None:
         diff = a_exact - a_calc
@@ -169,6 +169,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     attn_hyper = HyperAttention(
         input_dim=dim,  # config.input_dim == dim
+        lsh_num_projs=config.lsh_num_projs,
         block_size=config.block_size,
         sample_size=config.sample_size,
         min_seq_len=config.min_seq_len,
@@ -185,7 +186,8 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_hyper ------------")
     print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
-    print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n\n")
+    print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})")
+    print(f"Its exact data stats are (mean:{a_exact_m.item():.5f}, std:{a_exact_std.item():.5f})\n\n")
 
     return a_exact, a_block, max_spectral_error_ratio
 
@@ -202,8 +204,10 @@ def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim
     co_size = min(config.block_size, 4)
     q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=False)
 
-    compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix="Compare results with input k, k, v: ")
-    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix="Compare results with input q, k, v: ")
+    log_prefix="============ Compare results with input k, k, v ============"
+    compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
+    log_prefix="============ Compare results with input q, k, v ============"
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
     return q, k, v, max_spectral_error_ratio
 
 

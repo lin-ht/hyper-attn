@@ -192,12 +192,27 @@ class HyperAttention(torch.nn.Module):
                 attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
 
             weights = torch.clamp((n_key - block_mask_cnt) / sample_size, min=1.0) # weights >= 1.0
-            lse_res = lse_res + torch.log(weights)
 
             # Add two attentions
             if key_block_size > 0:
-                attn, lse = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
+                unseen_estimation_type = 1
+                if unseen_estimation_type == 0:
+                    # Don't add any sampled residual attentions:
+                    lse_res = lse_res + torch.log(weights)
+                    attn, lse = add_self_attentions(attn_block, lse_block, 0.0, lse_res)
+                elif unseen_estimation_type == 1:
+                    # Add only sampled residual attentions:
+                    attn_, lse_ = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
+                    # Treat the unseen part as zero attentions,
+                    # i.e. assuming the mean of the rest of residual attentions is zero.
+                    lse_res = lse_res + torch.log(weights - 1.0)
+                    attn, lse = add_self_attentions(attn_, lse_, 0.0, lse_res)
+                else:
+                    # Approximate unseen residual attentions from sampled ones:
+                    lse_res = lse_res + torch.log(weights)
+                    attn, lse = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
             else:
+                lse_res = lse_res + torch.log(weights)
                 attn, lse = attn_res, lse_res
         else:
             # Only one block, no approximation
