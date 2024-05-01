@@ -203,9 +203,9 @@ class HyperAttention(torch.nn.Module):
                 block_mask = block_mask | double_sampled
 
         if block_mask is not None:
-            block_mask.view(batch_size, head_size, -1, sample_size)
+            block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
             new_sample_cnt = sample_size - block_mask.sum(dim=-1, keepdim=True)
-            block_mask *= torch.finfo(query.dtype).min # adding -inf to QK^T to mask out
+            block_mask = block_mask.to(query.dtype) * torch.finfo(query.dtype).min # adding -inf to QK^T to mask out
         else:
             new_sample_cnt = torch.ones(1) * sample_size
         return block_mask, new_sample_cnt
@@ -234,20 +234,12 @@ class HyperAttention(torch.nn.Module):
             key_subset = indexing(key_, sampled_set)
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
-            # offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
-            offset_n = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
             if self.impl != "cuda":
-                if key_block_size > 0:
-                    # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
-                    block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
-                    block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
-                    block_mask = block_mask.to(query_.dtype)
-                    sampled_cnt =  sample_size - block_mask.sum(dim=-1, keepdim=True)
-                    block_mask *= torch.finfo(query_.dtype).min # adding -inf to QK^T to mask out
-                else:
-                    sampled_cnt = torch.ones(1) * sample_size
-                    block_mask = None
-
+                block_mask, sampled_cnt = self.get_block_mask(query_,
+                                                              new_samples=sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                              sampled_set=None,
+                                                              query_block_size=query_block_size,
+                                                              key_block_size=key_block_size)
                 attn_res, lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
                 sampled_cnt = torch.ones(1) * sample_size
@@ -268,22 +260,11 @@ class HyperAttention(torch.nn.Module):
 
             # Compute mask for hiding A_ij computed in block-diagonal attention and previously sampled attentions
             if self.impl != "cuda":
-                if key_block_size > 0:
-                    # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
-                    sampled_set = sampled_set.view(-1, 1, sample_size)
-                    topk_sampled_set = topk_sampled_set.view(-1, 1, sample_size)
-                    topk_block_mask = (offset_n // query_block_size) == (topk_sampled_set // key_block_size)
-                    double_sampled = torch.zeros_like(topk_sampled_set, dtype=torch.bool)
-                    for i in range(topk_block_mask.shape[0]):
-                        double_sampled[i, 0, :] = torch.isin(topk_sampled_set[i, 0, :], sampled_set[i, 0, :], assume_unique=True).view(1, 1, sample_size)
-                    topk_block_mask = topk_block_mask | double_sampled
-                    topk_block_mask = topk_block_mask.view(batch_size, head_size, -1, sample_size)
-                    topk_block_mask = topk_block_mask.to(query_.dtype)
-                    topk_sampled_cnt = sample_size - topk_block_mask.sum(dim=-1, keepdim=True)
-                    topk_block_mask *= torch.finfo(query_.dtype).min # adding -inf to QK^T to mask out
-                else:
-                    topk_sampled_cnt = torch.ones(1) * sample_size
-                    topk_block_mask = None
+                topk_block_mask, topk_sampled_cnt = self.get_block_mask(query_,
+                                                                        new_samples=topk_sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                                        sampled_set=sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                                        query_block_size=query_block_size,
+                                                                        key_block_size=key_block_size)
 
                 topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=topk_block_mask)
             else:
@@ -305,7 +286,8 @@ class HyperAttention(torch.nn.Module):
             # Only one block, no approximation
             attn, lse = attn_paired, lse_paired
 
-        # Re-order rows with the inverse order for query_sorted -> query
-        attn = indexing(attn, query_sort_idx_inv)
-        lse = indexing(lse, query_sort_idx_inv)
+        if self.pairing_method == 'lsh':
+            # Re-order rows with the inverse order for query_sorted -> query
+            attn = indexing(attn, query_sort_idx_inv)
+            lse = indexing(lse, query_sort_idx_inv)
         return attn, lse
