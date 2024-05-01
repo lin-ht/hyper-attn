@@ -1,6 +1,7 @@
 import math
 import torch
 from einops import rearrange
+from typing import Optional
 
 from attention.hyper_attn.utils import (
     exact_attention,
@@ -14,9 +15,9 @@ from attention.hyper_attn.angular_lsh import AngularLSH
 
 class HyperAttention(torch.nn.Module):
 
-    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, approximate_unsampled=True, impl='xformers'):
+    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, pairing_method='lsh', approximate_unsampled=True, impl='xformers'):
         """
-        Hyperbolic attention module.
+        Hyper attention module.
         Input parameters:
             - input_dim: int, the dimension of input query and key
             - lsh_num_projs: int, the number of projections for LSH
@@ -32,6 +33,7 @@ class HyperAttention(torch.nn.Module):
         self.block_size = block_size
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
+        self.pairing_method = pairing_method  # 'lsh' or 'anns'
         self.impl = impl
         self.approximate_unsampled = approximate_unsampled
         self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
@@ -106,15 +108,11 @@ class HyperAttention(torch.nn.Module):
         else:
             return attn, lse
 
-
-    def forward_no_causal_mask(self, query, key, value, scale):
+    def attention_by_lsh_sort(self, query, key, value, scale):
         batch_size, head_size, n_query, dim = query.shape
         n_key = key.shape[2]
 
-        if self.min_seq_len >= n_query:
-            return self.exact_attn(query, key, value, scale, causal=False)
-
-        # 1. Sorted block-diagonal via sortLSH
+        # Sorted block-diagonal via sortLSH
         _, query_sort_idx = torch.sort(self.lsh.hash(query), dim=2, stable=True) # batch_size x head_size x n
         _, key_sort_idx = torch.sort(self.lsh.hash(key), dim=2, stable=True)
         query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
@@ -162,48 +160,111 @@ class HyperAttention(torch.nn.Module):
             query_sorted = indexing(query, query_sort_idx)
             attn_block, lse_block = 0, 0
 
+        return attn_block, lse_block, query_sorted, key_sorted, value_sorted, query_block_size, key_block_size, query_sort_idx_inv
+
+    # def sampled_set_of_diagonal_blocks(self, n_query, query_block_size, n_key, key_block_size, device=None) -> torch.tensor|None:
+    #     if key_block_size <=0 or query_block_size <= 0:
+    #         return None
+    #     n_key_sup = (n_key+key_block_size-1)/key_block_size * key_block_size
+    #     key_range = torch.clamp(torch.arange(n_key_sup, device=device), max=n_key-1).reshape([-1, key_block_size])
+    #     sampled_set = key_range.repeat([1, query_block_size]).reshape([-1, key_block_size])
+    #     return sampled_set[:n_query, :]
+
+    def get_block_mask(self, query: torch.tensor, new_samples:torch.tensor, sampled_set:Optional[torch.tensor]=None, query_block_size=1, key_block_size=1) -> tuple[Optional[torch.tensor], torch.tensor]:
+        """
+        The shape of new_samples (sampled_set) could be [batch_size * head_size, n_query | 1, sample_size]
+        """
+        batch_size, head_size, n_query, dim = query.shape
+        sample_size = new_samples.shape[-1]
+
+        block_mask = None
+        # Exclude samples already covered by diagonal blocks
+        if self.pairing_method == 'lsh':
+            offset_n = torch.arange(n_query, device=query.device).reshape(1, -1, 1)
+            if key_block_size > 0 and query_block_size > 0:
+                # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+                block_mask = (offset_n // query_block_size) == (new_samples // key_block_size).view(-1, 1, sample_size)
+                block_mask = block_mask.view(batch_size * head_size, -1, sample_size)
+
+        # Exclude samples covered by existing samples
+        # Caution: ensure the samples of each row of sampled_set are unique.
+        if sampled_set is not None:
+            assert sampled_set.shape[0] == batch_size * head_size
+            double_sampled = torch.zeros_like(new_samples, dtype=torch.bool)
+            for i in range(double_sampled.shape[0]):
+                matched = sampled_set.shape[1] == new_samples.shape[1]
+                for j in range(double_sampled.shape[1]):
+                    sampled_set_j = sampled_set[i, j, :] if matched else sampled_set[i, 0, :]
+                    double_sampled[i, j, :] = torch.isin(new_samples[i, j, :], sampled_set_j, assume_unique=True).view(1, 1, sample_size)
+
+            if block_mask is None:
+                block_mask = double_sampled
+            else:
+                block_mask = block_mask | double_sampled
+
+        if block_mask is not None:
+            block_mask.view(batch_size, head_size, -1, sample_size)
+            new_sample_cnt = sample_size - block_mask.sum(dim=-1, keepdim=True)
+            block_mask *= torch.finfo(query.dtype).min # adding -inf to QK^T to mask out
+        else:
+            new_sample_cnt = torch.ones(1) * sample_size
+        return block_mask, new_sample_cnt
+
+    def forward_no_causal_mask(self, query, key, value, scale):
+        batch_size, head_size, n_query, dim = query.shape
+        n_key = key.shape[2]
+
+        if self.min_seq_len >= n_query:
+            return self.exact_attn(query, key, value, scale, causal=False)
+
+        # 1. Significant correlation guided sampling
+        if self.pairing_method == 'lsh':
+            attn_paired, lse_paired, query_, key_, value_, query_block_size, key_block_size, query_sort_idx_inv = self.attention_by_lsh_sort(query, key, value, scale)
+        else:
+            raise ValueError(f"Unknown pairing method: {self.pairing_method}")
+
         # 2. Residual low-rank part via uniform sampling
         # Sample indices uniformly at random
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > query_block_size) and (n_key > key_block_size):
             # Hack to have same probability for each key column
-            sample_prob = torch.ones(1, device=query_sorted.device).as_strided_((batch_size * head_size, n_key), (0, 0))
+            sample_prob = torch.ones(1, device=query_.device).as_strided_((batch_size * head_size, n_key), (0, 0))
             sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
-            value_subset = indexing(value_sorted, sampled_set)
-            key_subset = indexing(key_sorted, sampled_set)
+            value_subset = indexing(value_, sampled_set)
+            key_subset = indexing(key_, sampled_set)
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
             # offset_n = rearrange(torch.arange(n_query, device=query_sorted.device), 'n -> 1 n 1')
-            offset_n = torch.arange(n_query, device=query_sorted.device).reshape(1, -1, 1)
+            offset_n = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
             if self.impl != "cuda":
                 if key_block_size > 0:
                     # block_mask is a 4d-tensor with shape [batch_size, head_size, n_query, sample_size]
                     block_mask = (offset_n // query_block_size) == (sampled_set // key_block_size).view(-1, 1, sample_size)
                     block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
-                    block_mask = block_mask.to(query_sorted.dtype)
+                    block_mask = block_mask.to(query_.dtype)
                     sampled_cnt =  sample_size - block_mask.sum(dim=-1, keepdim=True)
-                    block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf to QK^T to mask out
+                    block_mask *= torch.finfo(query_.dtype).min # adding -inf to QK^T to mask out
                 else:
                     sampled_cnt = torch.ones(1) * sample_size
                     block_mask = None
 
-                attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
+                attn_res, lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
                 sampled_cnt = torch.ones(1) * sample_size
-                attn_res, lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
+                attn_res, lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False)
 
             # Add only sampled residual attentions:
             if key_block_size > 0:
-                attn_, lse_ = add_self_attentions(attn_block, lse_block, attn_res, lse_res)
+                attn_, lse_ = add_self_attentions(attn_paired, lse_paired, attn_res, lse_res)
             else:
                 attn_, lse_ = attn_res, lse_res
 
         # 3. Significant sampling according to Value
-            value_norms = torch.norm(value_sorted, dim=-1)
+            value_norms = torch.norm(value_, dim=-1)
             _, topk_sampled_set = torch.topk(value_norms, self.sample_size, dim=-1, largest=True, sorted=False)
             topk_sampled_set.reshape(batch_size, head_size, sample_size)
-            value_subset = indexing(value_sorted, topk_sampled_set)
-            key_subset = indexing(key_sorted, topk_sampled_set)
+            value_subset = indexing(value_, topk_sampled_set)
+            key_subset = indexing(key_, topk_sampled_set)
 
             # Compute mask for hiding A_ij computed in block-diagonal attention and previously sampled attentions
             if self.impl != "cuda":
@@ -217,17 +278,17 @@ class HyperAttention(torch.nn.Module):
                         double_sampled[i, 0, :] = torch.isin(topk_sampled_set[i, 0, :], sampled_set[i, 0, :], assume_unique=True).view(1, 1, sample_size)
                     topk_block_mask = topk_block_mask | double_sampled
                     topk_block_mask = topk_block_mask.view(batch_size, head_size, -1, sample_size)
-                    topk_block_mask = topk_block_mask.to(query_sorted.dtype)
+                    topk_block_mask = topk_block_mask.to(query_.dtype)
                     topk_sampled_cnt = sample_size - topk_block_mask.sum(dim=-1, keepdim=True)
-                    topk_block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf to QK^T to mask out
+                    topk_block_mask *= torch.finfo(query_.dtype).min # adding -inf to QK^T to mask out
                 else:
                     topk_sampled_cnt = torch.ones(1) * sample_size
                     topk_block_mask = None
 
-                topk_attn_res, topk_lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False, bias=topk_block_mask)
+                topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=topk_block_mask)
             else:
                 topk_sampled_cnt = torch.ones(1) * sample_size
-                topk_attn_res, topk_lse_res = self.exact_attn(query_sorted, key_subset, value_subset, scale, causal=False)
+                topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False)
 
             # Add only topk sampled residual attentions:
             attn_, lse_ = add_self_attentions(attn_, lse_, topk_attn_res, topk_lse_res)
@@ -242,7 +303,7 @@ class HyperAttention(torch.nn.Module):
             attn, lse = add_self_attentions(attn_, lse_, attn_res_unseen, lse_res_unseen)
         else:
             # Only one block, no approximation
-            attn, lse = attn_block, lse_block
+            attn, lse = attn_paired, lse_paired
 
         # Re-order rows with the inverse order for query_sorted -> query
         attn = indexing(attn, query_sort_idx_inv)

@@ -50,7 +50,7 @@ class AnnsHNSW(torch.nn.Module):
             index.addDataPointBatch(key_np[i, :, :])
             index.createIndex(self.index_time_params, print_progress=False)
 
-    def _convert_results(self, neighbors: list[tuple[np.ndarray, np.ndarray]]) -> torch.tensor:
+    def _convert_result(self, neighbors: list[tuple[np.ndarray, np.ndarray]]) -> torch.tensor:
         neighbors_ids = torch.cat([torch.tensor(ids) for ids, _ in neighbors], dim=-1)
         return neighbors_ids
 
@@ -64,7 +64,7 @@ class AnnsHNSW(torch.nn.Module):
 
         # Get the nearest neighbors
         neighbors = [index.knnQueryBatch(query_np[i, :, :], k=self.sample_size, num_threads=self.num_threads) for i, index in enumerate(self.ann_indices)]
-        sampled_set = self._convert_results(neighbors).reshape(*query.shape[:-1], self.sample_size)
+        sampled_set = self._convert_result(neighbors).reshape(*query.shape[:-1], self.sample_size).to(query.device)
         return sampled_set
 
     def __repr__(self):

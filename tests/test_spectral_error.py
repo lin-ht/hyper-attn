@@ -12,12 +12,13 @@ from attention.hyper_attn.utils import (
 from xformers.ops import fmha
 
 class HyperAttentionConfig:
-    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, approximate_unsampled=True, impl='xformers'):
+    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, pairing_method='lsh', approximate_unsampled=True, impl='xformers'):
         self.input_dim = input_dim
         self.lsh_num_projs = lsh_num_projs
         self.block_size = block_size
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
+        self.pairing_method = pairing_method
         self.approximate_unsampled = approximate_unsampled
         self.impl = impl
 
@@ -71,7 +72,15 @@ def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, b
     return q, k, v
 
 TEST_HYPER_ATTN_CONFIGS = [
-    HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='xformers'),
+    HyperAttentionConfig(
+        input_dim=64,
+        lsh_num_projs=7,
+        block_size=256,
+        sample_size=256,
+        min_seq_len=2048,
+        pairing_method='lsh',
+        approximate_unsampled=False,
+        impl='xformers'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='cuda'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='triton'),
 ]
@@ -174,6 +183,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
         block_size=config.block_size,
         sample_size=config.sample_size,
         min_seq_len=config.min_seq_len,
+        pairing_method=config.pairing_method,
         approximate_unsampled=config.approximate_unsampled,
         impl=config.impl).to(device='cuda', dtype=q.dtype)
 

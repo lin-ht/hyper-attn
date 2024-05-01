@@ -15,6 +15,6 @@ pybind11
 pytest
 torch
 tqdm
-triton==2.0.0.dev20221202 # This is the version of triton that FlashAttention was implemented with
-# triton
-xformers
+# triton==2.0.0.dev20221202 # This is the version of triton that FlashAttention was implemented with
+triton
+xformers==0.0.25
