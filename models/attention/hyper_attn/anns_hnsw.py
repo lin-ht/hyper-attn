@@ -93,7 +93,7 @@ class AnnsHNSW(torch.nn.Module):
         sampled_set_sorted = torch.gather(sampled_set, dim=-2, index=query_sort_idx.unsqueeze(-1).expand(-1, -1, -1, self.sample_size))
         sampled_set_picked = sampled_set_sorted[:, :, ::self.sample_size, :]
         # TODO: Refine the key_pick_idx_1st by replacing duplicates within each k queries with the 2nd or other nearest neighbors.
-        key_pick_idx = sampled_set_picked.to(device=query.device).contiguous().reshape([batch_size, head_size, -1])[:, :, :n_query]
+        key_pick_idx = sampled_set_picked.to(device=query.device).contiguous().reshape([batch_size, head_size, -1])
         return query_sort_idx, key_pick_idx
 
     def __repr__(self):

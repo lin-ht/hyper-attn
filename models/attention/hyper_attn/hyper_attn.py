@@ -1,6 +1,5 @@
 import math
 import torch
-from einops import rearrange
 from typing import Optional
 
 from attention.hyper_attn.utils import (
@@ -11,7 +10,7 @@ from attention.hyper_attn.utils import (
     indexing,
 )
 from attention.hyper_attn.angular_lsh import AngularLSH
-
+from attention.hyper_attn.anns_hnsw import AnnsHNSW
 
 class HyperAttention(torch.nn.Module):
 
@@ -36,7 +35,10 @@ class HyperAttention(torch.nn.Module):
         self.pairing_method = pairing_method  # 'lsh' or 'anns'
         self.impl = impl
         self.approximate_unsampled = approximate_unsampled
-        self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
+        if self.pairing_method == 'lsh':
+            self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
+        else:
+            self.anns = AnnsHNSW(sample_size=self.block_size)
 
         if impl == 'xformers':
             self.exact_attn = exact_attention_xformers
@@ -162,29 +164,113 @@ class HyperAttention(torch.nn.Module):
 
         return attn_block, lse_block, query_sorted, key_sorted, value_sorted, query_block_size, key_block_size, query_sort_idx_inv
 
-    # def sampled_set_of_diagonal_blocks(self, n_query, query_block_size, n_key, key_block_size, device=None) -> torch.tensor|None:
-    #     if key_block_size <=0 or query_block_size <= 0:
-    #         return None
-    #     n_key_sup = (n_key+key_block_size-1)/key_block_size * key_block_size
-    #     key_range = torch.clamp(torch.arange(n_key_sup, device=device), max=n_key-1).reshape([-1, key_block_size])
-    #     sampled_set = key_range.repeat([1, query_block_size]).reshape([-1, key_block_size])
-    #     return sampled_set[:n_query, :]
+    def attention_by_anns_pairing(self, query, key, value, scale):
+        batch_size, head_size, n_query, dim = query.shape
 
-    def get_block_mask(self, query: torch.tensor, new_samples:torch.tensor, sampled_set:Optional[torch.tensor]=None, query_block_size=1, key_block_size=1) -> tuple[Optional[torch.tensor], torch.tensor]:
+        block_size = self.block_size
+        if block_size > 0:
+            # query_sort_idx is [batch_size, head_size, n_query]
+            # sampled_set is [batch_size, head_size, block_size * (n_query // block_size)]
+            query_sort_idx, sampled_set = self.anns.build_indices(query, key)
+
+            # Query and key have the same size, padded if necessary
+            query_sorted = indexing(query, query_sort_idx, block_size)
+            value_picked = indexing(value, sampled_set, block_size)
+            key_picked = indexing(key, sampled_set, block_size)
+
+            # Reshape tensors to [batch_size*head_size, 1, block_size, dim] as Flash-attn only allows 4d-tensors
+            query_split_per_block = query_sorted.view(-1, 1, block_size, dim)
+            key_split_per_block = key_picked.view(-1, 1, block_size, dim)
+            value_split_per_block = value_picked.view(-1, 1, block_size, dim)
+
+            # This attn_block = (D^{-1}A)(V) and the D^{-1}A does softmax locally according to the block.
+            attn_block, lse_block = self.exact_attn(
+                query_split_per_block, key_split_per_block, value_split_per_block,
+                softmax_scale=scale, causal=False)
+
+            if attn_block.shape[2] not in attn_block.stride():
+                attn_block = attn_block.contiguous()
+            attn_block = attn_block.view(batch_size, head_size, query_sorted.shape[2], -1)
+
+            if lse_block.shape[2] not in lse_block.stride():
+                lse_block = lse_block.contiguous()
+            lse_block = lse_block.view(batch_size, head_size, query_sorted.shape[2], -1)
+
+            # When inputs are padded, then unpad them
+            if query_sorted.shape[2] != n_query: #query.shape[2]:
+                attn_block, lse_block = attn_block[:,:,:n_query,:], lse_block[:,:,:n_query,:]
+                # query_sorted = query_sorted[:,:,:n_query,:]
+
+            # Restore the order
+            attn_block = indexing(attn_block, query_sort_idx)
+            lse_block = indexing(lse_block, query_sort_idx)
+        else:
+            # Fall back to flash_attn2
+            attn_block, lse_block = 0, 0
+            sampled_set = None
+
+        return attn_block, lse_block, sampled_set
+
+    def get_block_mask_from_lsh(self, n_query, query_block_size, key_block_size, new_samples:torch.tensor, device='cuda'):
+        """
+        The shape of new_samples could be [batch_size * head_size, n_query | 1, sample_size]
+        Return bool mask indicates the valid new samples.
+        """
+        block_mask = None
+        sample_size = new_samples.shape[-1]
+
+        # Exclude samples already covered by diagonal blocks from lsh
+        offset_n = torch.arange(n_query, device=device).reshape(1, -1, 1)
+        if key_block_size > 0 and query_block_size > 0:
+            # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+            block_mask = (offset_n // query_block_size) == (new_samples // key_block_size).view(-1, 1, sample_size)
+            block_mask = block_mask.view(-1, n_query, sample_size)
+
+        return block_mask
+
+    def get_block_mask_from_anns(self, n_query, block_size, sampled_set:torch.tensor, new_samples:torch.tensor, device='cuda'):
+        """
+        The shape of the sampled_set is [batch_size * head_size, ceil(n_query/block_size) * block_size]
+        The shape of new_samples could be [batch_size * head_size, n_query | 1, sample_size]
+        Return bool mask indicates the valid new samples.
+        Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+        """
+        assert sampled_set.shape[0] == new_samples.shape[0], f"Sample batch size mismatch: {sampled_set.shape[0]} != {new_samples.shape[0]}"
+        sample_size = new_samples.shape[-1]
+
+        block_mask = None
+        if block_size > 0:
+            # Exclude samples covered by existing samples
+            # Caution: ensure the samples of each row of sampled_set are unique.
+            # sampled_set = sampled_set.reshape([new_samples.shape[0], -1, block_size])
+            block_mask = torch.zeros_like(new_samples, dtype=torch.bool)
+            unified = new_samples.shape[1] == 1
+            for i in range(new_samples.shape[0]):
+                for j in range(0, block_mask.shape[1], block_size):
+                    sampled_set_j = sampled_set[i, j:j+block_size]
+                    new_samples_j = new_samples[i, 0, :] if unified else new_samples[i, j:j+block_size, :]
+                    block_mask_j = torch.isin(new_samples_j, sampled_set_j, assume_unique=True).view(1, -1, sample_size)
+                    block_mask[i, j:j+block_size, :] = block_mask_j
+
+        return block_mask
+
+    def init_block_mask(self, n_query, new_samples:torch.tensor, sampled_set:Optional[torch.tensor]=None, query_block_size=1, key_block_size=1, device='cuda') -> torch.tensor:
+        if self.pairing_method == 'lsh':
+            block_mask = self.get_block_mask_from_lsh(n_query, query_block_size, key_block_size, new_samples, device)
+        elif self.pairing_method == 'anns':
+            assert sampled_set is not None, "sampled_set is required for anns"
+            assert query_block_size == key_block_size, "query_block_size should be equal to key_block_size for anns"
+            block_mask = self.get_block_mask_from_anns(n_query, query_block_size, sampled_set, new_samples, device)
+        else:
+            block_mask = None
+        return block_mask
+
+    def add_block_mask(self, query: torch.tensor, new_samples:torch.tensor, sampled_set:Optional[torch.tensor]=None, block_mask: Optional[torch.tensor]=None,  query_block_size=1, key_block_size=1) -> tuple[Optional[torch.tensor], torch.tensor]:
         """
         The shape of new_samples (sampled_set) could be [batch_size * head_size, n_query | 1, sample_size]
         """
         batch_size, head_size, n_query, dim = query.shape
         sample_size = new_samples.shape[-1]
-
-        block_mask = None
-        # Exclude samples already covered by diagonal blocks
-        if self.pairing_method == 'lsh':
-            offset_n = torch.arange(n_query, device=query.device).reshape(1, -1, 1)
-            if key_block_size > 0 and query_block_size > 0:
-                # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
-                block_mask = (offset_n // query_block_size) == (new_samples // key_block_size).view(-1, 1, sample_size)
-                block_mask = block_mask.view(batch_size * head_size, -1, sample_size)
 
         # Exclude samples covered by existing samples
         # Caution: ensure the samples of each row of sampled_set are unique.
@@ -201,11 +287,13 @@ class HyperAttention(torch.nn.Module):
                 block_mask = double_sampled
             else:
                 block_mask = block_mask | double_sampled
+        return block_mask
 
+    def finalize_block_mask(self, batch_size, head_size, sample_size, dtype, block_mask:Optional[torch.tensor]=None):
         if block_mask is not None:
             block_mask = block_mask.view(batch_size, head_size, -1, sample_size)
             new_sample_cnt = sample_size - block_mask.sum(dim=-1, keepdim=True)
-            block_mask = block_mask.to(query.dtype) * torch.finfo(query.dtype).min # adding -inf to QK^T to mask out
+            block_mask = block_mask.to(dtype) * torch.finfo(dtype).min # adding -inf to QK^T to mask out
         else:
             new_sample_cnt = torch.ones(1) * sample_size
         return block_mask, new_sample_cnt
@@ -220,6 +308,11 @@ class HyperAttention(torch.nn.Module):
         # 1. Significant correlation guided sampling
         if self.pairing_method == 'lsh':
             attn_paired, lse_paired, query_, key_, value_, query_block_size, key_block_size, query_sort_idx_inv = self.attention_by_lsh_sort(query, key, value, scale)
+            block_sampled_set = None
+        elif self.pairing_method == 'anns':
+            query_block_size, key_block_size = self.block_size, self.block_size
+            query_, key_, value_ = query, key, value
+            attn_paired, lse_paired, block_sampled_set = self.attention_by_anns_pairing(query, key, value, scale)
         else:
             raise ValueError(f"Unknown pairing method: {self.pairing_method}")
 
@@ -235,11 +328,13 @@ class HyperAttention(torch.nn.Module):
 
             # Compute mask for hiding A_ij computed in block-diagonal attention
             if self.impl != "cuda":
-                block_mask, sampled_cnt = self.get_block_mask(query_,
-                                                              new_samples=sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                              sampled_set=None,
-                                                              query_block_size=query_block_size,
-                                                              key_block_size=key_block_size)
+                block_mask = self.init_block_mask(n_query,
+                                                  sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                  block_sampled_set,
+                                                  query_block_size,
+                                                  key_block_size,
+                                                  device=query_.device)
+                block_mask, sampled_cnt = self.finalize_block_mask(batch_size, head_size, sample_size, query_.dtype, block_mask)
                 attn_res, lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
                 sampled_cnt = torch.ones(1) * sample_size
@@ -260,12 +355,19 @@ class HyperAttention(torch.nn.Module):
 
             # Compute mask for hiding A_ij computed in block-diagonal attention and previously sampled attentions
             if self.impl != "cuda":
-                topk_block_mask, topk_sampled_cnt = self.get_block_mask(query_,
-                                                                        new_samples=topk_sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                                        sampled_set=sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                                        query_block_size=query_block_size,
-                                                                        key_block_size=key_block_size)
-
+                topk_block_mask = self.init_block_mask(n_query,
+                                                       topk_sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                       block_sampled_set,
+                                                       query_block_size,
+                                                       key_block_size,
+                                                       device=query_.device)
+                topk_block_mask = self.add_block_mask(query_,
+                                                      topk_sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                      sampled_set.view(batch_size * head_size, 1, sample_size),
+                                                      topk_block_mask,
+                                                      query_block_size,
+                                                      key_block_size)
+                topk_block_mask, topk_sampled_cnt = self.finalize_block_mask(batch_size, head_size, sample_size, query_.dtype, topk_block_mask)
                 topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=topk_block_mask)
             else:
                 topk_sampled_cnt = torch.ones(1) * sample_size
