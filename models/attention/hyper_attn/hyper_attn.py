@@ -32,6 +32,7 @@ class HyperAttention(torch.nn.Module):
         self.block_size = block_size
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
+        self.apply_2d_local_sampling = False
         self.pairing_method = pairing_method  # 'lsh' or 'anns'
         self.impl = impl
         self.approximate_unsampled = approximate_unsampled
@@ -47,6 +48,61 @@ class HyperAttention(torch.nn.Module):
         else:
             self.exact_attn = exact_attention
 
+    def treat_sequence_as_2d(self):
+        self.apply_2d_local_sampling = True
+
+    def spatial_sampling(self, n_query: int, n_key: int, aspect_ratio: float, sample_size: int, device: str = 'cuda'):
+        """
+        Spatial sampling for the attention matrix A.
+        a_r = w / h => w = a_r * h => h = sqrt(n_query / a_r)
+        """
+        h_query = int(math.sqrt(n_query/aspect_ratio))
+        w_query = int(n_query / h_query)
+
+        h_key = int(math.sqrt(n_key/aspect_ratio))
+        w_key = int(n_key / h_key)
+
+        if h_query * w_query != n_query or h_key * w_key != n_key:
+            print(f"Invalid query sequence length: {h_query} * {w_query} != {n_query}")
+            print(f"Invalid key sequence length: {h_key} * {w_key} != {n_key}")
+            print(f"No spatial sampling.")
+            return None
+        elif sample_size <= 0:
+            print(f"Invalid sample size: {sample_size}")
+            print(f"No spatial sampling.")
+            return None
+        else:
+            h_sample_size = int(math.sqrt(sample_size/aspect_ratio))
+            w_sample_size = int(sample_size / h_sample_size)
+            h_sample_size_half = h_sample_size // 2
+            w_sample_size_half = w_sample_size // 2
+            if h_key < h_sample_size or w_key < w_sample_size:
+                print(f"Sample size is too large: height {h_sample_size}>{h_key} or width {w_sample_size}>{w_key}")
+                print(f"No spatial sampling.")
+                return None
+
+            py_query, px_query = torch.unravel_index(torch.arange(n_query, device=device), (h_query, w_query))
+            py_key = (py_query/h_query * h_key).to(torch.int)
+            px_key = (px_query/w_query * w_key).to(torch.int)
+            y_sample_seq = torch.arange(h_sample_size, device=device).view(1, h_sample_size)
+            x_sample_seq = torch.arange(w_sample_size, device=device).view(1, w_sample_size)
+            py_key_s = torch.clamp(py_key - h_sample_size_half, min=0, max=h_key - h_sample_size - 1).view(-1, 1)
+            px_key_s = torch.clamp(px_key - w_sample_size_half, min=0, max=w_key - w_sample_size - 1).view(-1, 1)
+            py_samples = py_key_s + y_sample_seq
+            px_samples = px_key_s + x_sample_seq
+            sampled_set = py_samples * w_key + px_samples
+
+            return sampled_set  # [n_query, sample_size]
+
+    def sort_spatial_samples(self, sampled_set: torch.tensor, query_sort_idx: torch.tensor, key_sort_idx_inv: torch.tensor):
+        """
+        query_sort_idx: [batch_size, head_size, n_query]
+        """
+        batch_size, head_size, n_query = query_sort_idx.shape
+        sampled_set_sorted = indexing(sampled_set.view(1, 1, n_query, -1).expand((batch_size, head_size, -1, -1)), query_sort_idx)
+        # let s[bi, hi, ni, si] = ki, we want new_s[bi, hi, ni, si] = inv[bi, hi, ki] = inv[bi, hi, s[bi, hi, ni, si]]
+        sampled_set_sorted = key_sort_idx_inv.expand((-1, -1, n_query, -1)).gather(-1, sampled_set_sorted)
+        return sampled_set_sorted
 
     def forward(self, query: torch.tensor, key: torch.tensor, value: torch.tensor, scale=None, causal=False, return_lse=False):
         query = query.contiguous()
@@ -378,7 +434,11 @@ class HyperAttention(torch.nn.Module):
             # Add only topk sampled residual attentions:
             attn_, lse_ = add_self_attentions(attn_, lse_, topk_attn_res, topk_lse_res)
 
-            # Unseen part approximation
+        # 4. Local sampling
+            # if self.apply_2d_local_sampling:
+                #TODO: implement the 2D local sampling
+
+        # 5. Unseen part approximation
             weights = torch.clamp((n_key - sampled_cnt - topk_sampled_cnt - key_block_size) / (sampled_cnt + 1e-6), min=0.0) # weights >= 0.0
             lse_res_unseen = lse_res + torch.log(weights)
             # Treat the unseen part as zero attentions if unseen_estimation_type is 0,
