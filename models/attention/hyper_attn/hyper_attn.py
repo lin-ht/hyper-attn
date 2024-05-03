@@ -171,7 +171,8 @@ class HyperAttention(torch.nn.Module):
         if block_size > 0:
             # query_sort_idx is [batch_size, head_size, n_query]
             # sampled_set is [batch_size, head_size, block_size * (n_query // block_size)]
-            query_sort_idx, sampled_set = self.anns.build_indices(query, key)
+            query_sort_idx, sampled_set = self.anns.anns_pairing(query, key)
+            query_sort_idx_inv = torch.argsort(query_sort_idx, dim=-1, stable=True) # for recovering the row order
 
             # Query and key have the same size, padded if necessary
             query_sorted = indexing(query, query_sort_idx, block_size)
@@ -200,16 +201,12 @@ class HyperAttention(torch.nn.Module):
             if query_sorted.shape[2] != n_query: #query.shape[2]:
                 attn_block, lse_block = attn_block[:,:,:n_query,:], lse_block[:,:,:n_query,:]
                 # query_sorted = query_sorted[:,:,:n_query,:]
-
-            # Restore the order
-            attn_block = indexing(attn_block, query_sort_idx)
-            lse_block = indexing(lse_block, query_sort_idx)
         else:
             # Fall back to flash_attn2
             attn_block, lse_block = 0, 0
             sampled_set = None
 
-        return attn_block, lse_block, sampled_set
+        return attn_block, lse_block, sampled_set, query_sorted, query_sort_idx_inv
 
     def get_block_mask_from_lsh(self, n_query, query_block_size, key_block_size, new_samples:torch.tensor, device='cuda'):
         """
@@ -243,7 +240,7 @@ class HyperAttention(torch.nn.Module):
             # Exclude samples covered by existing samples
             # Caution: ensure the samples of each row of sampled_set are unique.
             # sampled_set = sampled_set.reshape([new_samples.shape[0], -1, block_size])
-            block_mask = torch.zeros_like(new_samples, dtype=torch.bool)
+            block_mask = torch.zeros([new_samples.shape[0], n_query, new_samples.shape[-1]], dtype=torch.bool, device=device)
             unified = new_samples.shape[1] == 1
             for i in range(new_samples.shape[0]):
                 for j in range(0, block_mask.shape[1], block_size):
@@ -265,11 +262,11 @@ class HyperAttention(torch.nn.Module):
             block_mask = None
         return block_mask
 
-    def add_block_mask(self, query: torch.tensor, new_samples:torch.tensor, sampled_set:Optional[torch.tensor]=None, block_mask: Optional[torch.tensor]=None,  query_block_size=1, key_block_size=1) -> tuple[Optional[torch.tensor], torch.tensor]:
+    def add_block_mask(self, query: torch.tensor, new_samples:torch.tensor, sampled_set:Optional[torch.tensor]=None, block_mask: Optional[torch.tensor]=None) -> tuple[Optional[torch.tensor], torch.tensor]:
         """
         The shape of new_samples (sampled_set) could be [batch_size * head_size, n_query | 1, sample_size]
         """
-        batch_size, head_size, n_query, dim = query.shape
+        batch_size, head_size = query.shape[:2]
         sample_size = new_samples.shape[-1]
 
         # Exclude samples covered by existing samples
@@ -311,8 +308,8 @@ class HyperAttention(torch.nn.Module):
             block_sampled_set = None
         elif self.pairing_method == 'anns':
             query_block_size, key_block_size = self.block_size, self.block_size
-            query_, key_, value_ = query, key, value
-            attn_paired, lse_paired, block_sampled_set = self.attention_by_anns_pairing(query, key, value, scale)
+            key_, value_ = key, value
+            attn_paired, lse_paired, block_sampled_set, query_, query_sort_idx_inv = self.attention_by_anns_pairing(query, key, value, scale)
         else:
             raise ValueError(f"Unknown pairing method: {self.pairing_method}")
 
@@ -330,7 +327,7 @@ class HyperAttention(torch.nn.Module):
             if self.impl != "cuda":
                 block_mask = self.init_block_mask(n_query,
                                                   sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                  block_sampled_set,
+                                                  block_sampled_set.view(batch_size * head_size, -1),
                                                   query_block_size,
                                                   key_block_size,
                                                   device=query_.device)
@@ -357,16 +354,14 @@ class HyperAttention(torch.nn.Module):
             if self.impl != "cuda":
                 topk_block_mask = self.init_block_mask(n_query,
                                                        topk_sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                       block_sampled_set,
+                                                       block_sampled_set.view(batch_size * head_size, -1),
                                                        query_block_size,
                                                        key_block_size,
                                                        device=query_.device)
                 topk_block_mask = self.add_block_mask(query_,
                                                       topk_sampled_set.view(batch_size * head_size, 1, sample_size),
                                                       sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                      topk_block_mask,
-                                                      query_block_size,
-                                                      key_block_size)
+                                                      topk_block_mask)
                 topk_block_mask, topk_sampled_cnt = self.finalize_block_mask(batch_size, head_size, sample_size, query_.dtype, topk_block_mask)
                 topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=topk_block_mask)
             else:
@@ -388,8 +383,8 @@ class HyperAttention(torch.nn.Module):
             # Only one block, no approximation
             attn, lse = attn_paired, lse_paired
 
-        if self.pairing_method == 'lsh':
-            # Re-order rows with the inverse order for query_sorted -> query
-            attn = indexing(attn, query_sort_idx_inv)
-            lse = indexing(lse, query_sort_idx_inv)
+        # if query_sort_idx_inv is not None:
+        # Re-order rows with the inverse order for query_sorted -> query
+        attn = indexing(attn, query_sort_idx_inv)
+        lse = indexing(lse, query_sort_idx_inv)
         return attn, lse

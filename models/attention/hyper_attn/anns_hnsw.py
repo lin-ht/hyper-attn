@@ -26,31 +26,36 @@ class AnnsHNSW(torch.nn.Module):
     # P(k) = [... k_i ..., sqrt(M^2 - ||k||)]
     # Q(q) = [... r*q_i ..., 0], where r=M/||q||
     # M is the maximum norm of the key vectors
-    def _transform_key(self, key: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
+    def _transform_key(self, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         key_norm = key.norm(dim=-1)
         key_norm_max = key_norm.max(dim=-1, keepdim=True).values
         key_extra = torch.sqrt(key_norm_max ** 2 - key_norm ** 2)
         key_qnf = torch.cat([key, key_extra.unsqueeze_(-1)], dim=-1)
         return key_qnf, key_norm_max
 
-    def _transform_query(self, query: torch.tensor, key_norm_max: torch.tensor) -> torch.tensor:
-        query_norm = torch.maximum(query.norm(dim=-1), torch.tensor(1e-6))
+    def _transform_query(self, query: torch.Tensor, key_norm_max: torch.Tensor) -> torch.Tensor:
+        query_norm = torch.maximum(query.norm(dim=-1), torch.tensor([1e-6], device=query.device))
         r = key_norm_max / query_norm
         query_qnf = torch.cat([r.unsqueeze_(-1) * query, torch.zeros_like(query_norm).unsqueeze_(-1)], dim=-1)
         return query_qnf
 
-    def build_indices(self, query: torch.tensor, key: torch.tensor) -> None:
+    def build_indices(self, query: torch.Tensor, key: torch.Tensor) -> None:
         batch_size, head_size = key.shape[:2]
         self.index_count = batch_size * head_size
 
         key_qnf, key_norm_max = self._transform_key(key)
         key_qnf = key_qnf.contiguous()
-        self.key_np = torch.numpy(key_qnf, force=True).reshape(self.index_count, -1, key_qnf.shape[-1])
+        # numpy doesn't support bfloat16
+        if key_qnf.dtype == torch.bfloat16:
+            key_qnf = key_qnf.float()
+        self.key_np = torch.Tensor.numpy(key_qnf, force=True).reshape(self.index_count, -1, key_qnf.shape[-1])
         self.key_norm_max = key_norm_max
 
         query_qnf = self._transform_query(query, key_norm_max)
         query_qnf = query_qnf.contiguous()
-        self.query_np = torch.numpy(query_qnf, force=True).reshape(self.index_count, -1, query_qnf.shape[-1])
+        if query_qnf.dtype == torch.bfloat16:
+            query_qnf = query_qnf.float()
+        self.query_np = torch.Tensor.numpy(query_qnf, force=True).reshape(self.index_count, -1, query_qnf.shape[-1])
 
         tqdm_bar = tqdm(range(self.index_count), desc="Building ANNS indices")
         # for i, index in enumerate(self.ann_indices):
@@ -69,11 +74,14 @@ class AnnsHNSW(torch.nn.Module):
         #     self.q_anns_indices.append(q_anns_index)
 
 
-    def _convert_result(self, neighbors: list[tuple[np.ndarray, np.ndarray]]) -> torch.tensor:
-        neighbors_ids = torch.cat([torch.tensor(ids) for ids, _ in neighbors], dim=-1)
-        return neighbors_ids
+    def _convert_result(self, neighbors: list[tuple[np.ndarray, np.ndarray]]) -> torch.Tensor:
+        neighbors_ids = []
+        for b in neighbors:
+            neighbors_ids.append(torch.cat([torch.Tensor(ids if len(ids)==self.sample_size else np.pad(ids, (0, self.sample_size - len(ids)), 'constant', constant_values=(0, 0))).unsqueeze_(0) for ids, _ in b], dim=0))
+        neighbors_mat = torch.cat([torch.Tensor(ids).unsqueeze_(0) for ids in neighbors_ids], dim=0).to(dtype=torch.int64)
+        return neighbors_mat
 
-    def anns_pairing(self, query: torch.tensor, key: torch.tensor) -> torch.tensor:
+    def anns_pairing(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
         if self.key_norm_max is None:
             print("Building the indices first")
             self.build_indices(query, key)
