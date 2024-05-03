@@ -36,7 +36,7 @@ class HyperAttention(torch.nn.Module):
         self.impl = impl
         self.approximate_unsampled = approximate_unsampled
         if self.pairing_method == 'lsh':
-            self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
+            self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim + 1))  # dim: (heads, seq_len, query/key_dim)
         else:
             self.anns = AnnsHNSW(sample_size=self.block_size)
 
@@ -115,8 +115,14 @@ class HyperAttention(torch.nn.Module):
         n_key = key.shape[2]
 
         # Sorted block-diagonal via sortLSH
-        _, query_sort_idx = torch.sort(self.lsh.hash(query), dim=2, stable=True) # batch_size x head_size x n
-        _, key_sort_idx = torch.sort(self.lsh.hash(key), dim=2, stable=True)
+        if self.lsh.feature_dim == key.shape[-1] + 1:
+            key_, key_norm_max = self.lsh.transform_key(key)
+            query_ = self.lsh.transform_query(query, key_norm_max)
+        else:
+            key_, query_ = key, query
+
+        _, query_sort_idx = torch.sort(self.lsh.hash(query_), dim=2, stable=True) # batch_size x head_size x n
+        _, key_sort_idx = torch.sort(self.lsh.hash(key_), dim=2, stable=True)
         query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
 
         key_block_size = self.block_size
@@ -305,11 +311,12 @@ class HyperAttention(torch.nn.Module):
         # 1. Significant correlation guided sampling
         if self.pairing_method == 'lsh':
             attn_paired, lse_paired, query_, key_, value_, query_block_size, key_block_size, query_sort_idx_inv = self.attention_by_lsh_sort(query, key, value, scale)
-            block_sampled_set = None
+            block_sampled_set_view = None
         elif self.pairing_method == 'anns':
             query_block_size, key_block_size = self.block_size, self.block_size
             key_, value_ = key, value
             attn_paired, lse_paired, block_sampled_set, query_, query_sort_idx_inv = self.attention_by_anns_pairing(query, key, value, scale)
+            block_sampled_set_view = block_sampled_set.view(batch_size * head_size, -1)
         else:
             raise ValueError(f"Unknown pairing method: {self.pairing_method}")
 
@@ -327,7 +334,7 @@ class HyperAttention(torch.nn.Module):
             if self.impl != "cuda":
                 block_mask = self.init_block_mask(n_query,
                                                   sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                  block_sampled_set.view(batch_size * head_size, -1),
+                                                  block_sampled_set_view,
                                                   query_block_size,
                                                   key_block_size,
                                                   device=query_.device)
@@ -354,7 +361,7 @@ class HyperAttention(torch.nn.Module):
             if self.impl != "cuda":
                 topk_block_mask = self.init_block_mask(n_query,
                                                        topk_sampled_set.view(batch_size * head_size, 1, sample_size),
-                                                       block_sampled_set.view(batch_size * head_size, -1),
+                                                       block_sampled_set_view,
                                                        query_block_size,
                                                        key_block_size,
                                                        device=query_.device)

@@ -6,6 +6,7 @@ class AngularLSH(torch.nn.Module):
     def __init__(self, num_projs, dim, rng=None):
         super().__init__()
         self.num_projs = num_projs
+        self.feature_dim = dim[-1]
 
         if num_projs > 0:
             # proj_dir is a tensor of shape (*dim, num_projs)
@@ -46,6 +47,23 @@ class AngularLSH(torch.nn.Module):
         a_len_half = a_len // 2
         return torch.concat([a, a[a_len_half:] + a_len, a[:a_len_half] + a_len], 0)
 
+    # The Asymmetric query normalized first (QNF) transformation:
+    # P(k) = [... k_i ..., sqrt(M^2 - ||k||)]
+    # Q(q) = [... r*q_i ..., 0], where r=M/||q||
+    # M is the maximum norm of the key vectors
+    def transform_key(self, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        key_norm = key.norm(dim=-1, dtype=key.dtype)
+        key_norm_max = key_norm.max(dim=-1, keepdim=True).values
+        key_extra = torch.sqrt(key_norm_max ** 2 - key_norm ** 2)
+        key_qnf = torch.cat([key, key_extra.unsqueeze_(-1)], dim=-1)
+        return key_qnf, key_norm_max
+
+    def transform_query(self, query: torch.Tensor, key_norm_max: torch.Tensor) -> torch.Tensor:
+        query_norm = torch.maximum(query.norm(dim=-1, dtype=query.dtype), torch.tensor([1e-6], dtype=query.dtype, device=query.device))
+        r = key_norm_max / query_norm
+        query_qnf = torch.cat([r.unsqueeze_(-1) * query, torch.zeros_like(query_norm).unsqueeze_(-1)], dim=-1)
+        return query_qnf
+
     def hash(self, mat):
         if self.num_projs < 0:
             return torch.zeros(mat.shape[:-1], device=mat.device, dtype=torch.int32)
@@ -56,8 +74,8 @@ class AngularLSH(torch.nn.Module):
         # Random index for our testing case.
         # bin_ids = torch.randint(2 ** self.num_projs, size=bin_ids.shape, device=bin_ids.device)
         # Ground truth index for our testing case.
-        return torch.arange(mat.shape[-2], device=bin_ids.device).repeat(mat.shape[0], mat.shape[1], 1)
-        # return self.perm[bin_ids]  # map hamming code to hash index (in angular order)
+        # return torch.arange(mat.shape[-2], device=bin_ids.device).repeat(mat.shape[0], mat.shape[1], 1)
+        return self.perm[bin_ids]  # map hamming code to hash index (in angular order)
 
     def __repr__(self):
         return f"AngularLSH(num_proj={self.num_projs}, proj_dir.shape={self.proj_dir.shape})"

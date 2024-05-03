@@ -74,12 +74,12 @@ def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, b
 TEST_HYPER_ATTN_CONFIGS = [
     HyperAttentionConfig(
         input_dim=64,
-        lsh_num_projs=7,
+        lsh_num_projs=15,
         block_size=256,
         sample_size=256,
         min_seq_len=2048,
-        # pairing_method='lsh',
-        pairing_method='anns',
+        pairing_method='lsh',
+        # pairing_method='anns',
         approximate_unsampled=False,
         impl='xformers'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='cuda'),
@@ -217,9 +217,9 @@ def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim
     co_size = min(config.block_size, 4)
     q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=False)
 
-    log_prefix="============ Compare results with input k, k, v ============"
+    log_prefix = "============ Compare results with input k, k, v ============"
     compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
-    log_prefix="============ Compare results with input q, k, v ============"
+    log_prefix = "============ Compare results with input q, k, v ============"
     a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
     return q, k, v, max_spectral_error_ratio
 
