@@ -166,6 +166,88 @@ class HyperAttention(torch.nn.Module):
         else:
             return attn, lse
 
+    def attention_by_spatial_pairing(self, query, key, value, scale, aspect_ratio, lsh_query_sort_idx_inv, lsh_key_sort_idx_inv, lsh_query_block_size, lsh_key_block_size):
+        batch_size, head_size, n_query, dim = query.shape
+        n_key = key.shape[2]
+
+        h_query = int(math.sqrt(n_query/aspect_ratio))
+        w_query = int(n_query / h_query)
+
+        h_key = int(math.sqrt(n_key/aspect_ratio))
+        w_key = int(n_key / h_key)
+
+        sample_size = self.block_size
+        h_sample_size_key = int(math.sqrt(sample_size/aspect_ratio))
+        w_sample_size_key = int(sample_size / h_sample_size_key)
+
+        n_h_blocks = h_key // h_sample_size_key
+        n_w_blocks = w_key // w_sample_size_key
+        n_blocks = n_h_blocks * n_w_blocks
+
+        # TODO: handle the case with padding.
+        assert n_h_blocks * h_sample_size_key == h_key, f"Invalid key height: {n_h_blocks} * {h_sample_size_key} != {h_key}"
+        assert n_w_blocks * w_sample_size_key == w_key, f"Invalid key width: {n_w_blocks} * {w_sample_size_key} != {w_key}"
+
+        h_sample_size_query = h_query // n_h_blocks
+        w_sample_size_query = w_query // n_w_blocks
+
+        assert n_h_blocks * h_sample_size_query == h_query, f"Invalid query height: {n_h_blocks} * {h_sample_size_query} != {h_query}"
+        assert n_w_blocks * w_sample_size_query == w_query, f"Invalid query width: {n_w_blocks} * {w_sample_size_query} != {w_query}"
+
+        query_sort_idx = torch.arange(n_query, device=query.device).reshape(n_h_blocks, h_sample_size_query, n_w_blocks, w_sample_size_query)
+        query_sort_idx = torch.permute(query_sort_idx, (0, 2, 1, 3)).reshape(1, 1, n_query)
+        query_sort_idx_full = query_sort_idx.expand(batch_size, head_size, -1)
+        query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
+
+        key_sort_idx = torch.arange(n_key, device=key.device).reshape(n_h_blocks, h_sample_size_key, n_w_blocks, w_sample_size_key)
+        key_sort_idx = torch.permute(key_sort_idx, (0, 2, 1, 3)).reshape(1, 1, n_key)
+        key_sort_idx_full = key_sort_idx.expand(batch_size, head_size, -1)
+
+        key_block_size = h_sample_size_key * w_sample_size_key
+        key_sorted = indexing(key, key_sort_idx_full, key_block_size)
+        value_sorted = indexing(value, key_sort_idx_full, key_block_size)
+
+        query_block_size = h_sample_size_query * w_sample_size_query
+        query_sorted = indexing(query, query_sort_idx_full, query_block_size)
+
+        # Reshape tensors to [batch_size*head_size, 1, block_size, dim] as Flash-attn only allows 4d-tensors
+        query_split_per_block = query_sorted.view(-1, 1, query_block_size, dim)
+        key_split_per_block = key_sorted.view(-1, 1, key_block_size, dim)
+        value_split_per_block = value_sorted.view(-1, 1, key_block_size, dim)
+
+        block_mask = lsh_query_sort_idx_inv.gather(-1, query_sort_idx_full) // lsh_query_block_size == lsh_key_sort_idx_inv.gather(-1, key_sort_idx_full) // lsh_key_block_size
+        block_mask.view(-1, 1, query_block_size, key_block_size)
+
+        block_mask, sampled_cnt = self.finalize_block_mask(batch_size*head_size*n_blocks, 1, key_block_size, query.dtype, block_mask)
+
+        # This attn_block = (D^{-1}A)(V) and the D^{-1}A does softmax locally according to the block.
+        attn_block, lse_block = self.exact_attn(
+            query_split_per_block, key_split_per_block, value_split_per_block,
+            softmax_scale=scale, causal=False, bias=block_mask)
+
+        if attn_block.shape[2] not in attn_block.stride():
+            attn_block = attn_block.contiguous()
+        attn_block = attn_block.view(batch_size, head_size, query_sorted.shape[2], -1)
+
+        if lse_block.shape[2] not in lse_block.stride():
+            lse_block = lse_block.contiguous()
+        lse_block = lse_block.view(batch_size, head_size, query_sorted.shape[2], -1)
+
+        # When inputs are padded, then unpad them
+        if query_sorted.shape[2] != n_query: #query.shape[2]:
+            attn_block, lse_block = attn_block[:,:,:n_query,:], lse_block[:,:,:n_query,:]
+            query_sorted = query_sorted[:,:,:n_query,:]
+        # key and query could be padded differently.
+        if key_sorted.shape[2] != n_key:
+            key_sorted = key_sorted[:,:,:n_key,:]
+            value_sorted = value_sorted[:,:,:n_key,:]
+
+        # Return reverse sort idxes for block mask generation
+        return attn_block, lse_block, query_sorted, key_sorted, value_sorted, query_block_size, key_block_size, query_sort_idx_inv
+
+
+
+
     def attention_by_lsh_sort(self, query, key, value, scale):
         batch_size, head_size, n_query, dim = query.shape
         n_key = key.shape[2]
@@ -180,6 +262,7 @@ class HyperAttention(torch.nn.Module):
         _, query_sort_idx = torch.sort(self.lsh.hash(query_), dim=2, stable=True) # batch_size x head_size x n
         _, key_sort_idx = torch.sort(self.lsh.hash(key_), dim=2, stable=True)
         query_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the row order
+        key_sort_idx_inv = torch.argsort(query_sort_idx, dim=2, stable=True) # for recovering the key order
 
         key_block_size = self.block_size
         key_sorted = indexing(key, key_sort_idx, key_block_size)
@@ -212,19 +295,23 @@ class HyperAttention(torch.nn.Module):
             # When inputs are padded, then unpad them
             if query_sorted.shape[2] != n_query: #query.shape[2]:
                 attn_block, lse_block = attn_block[:,:,:n_query,:], lse_block[:,:,:n_query,:]
-                query_sorted = query_sorted[:,:,:n_query,:]
+                # query_sorted = query_sorted[:,:,:n_query,:]
             # key and query could be padded differently.
-            if key_sorted.shape[2] != n_key:
-                key_sorted = key_sorted[:,:,:n_key,:]
-                value_sorted = value_sorted[:,:,:n_key,:]
+            # if key_sorted.shape[2] != n_key:
+            #     key_sorted = key_sorted[:,:,:n_key,:]
+            #     value_sorted = value_sorted[:,:,:n_key,:]
 
+            # Restore the original order
+            attn_block = indexing(attn_block, query_sort_idx_inv)
+            lse_block = indexing(lse_block, query_sort_idx_inv)
         else:
             # Fall back to flash_attn2
             query_block_size = -1
-            query_sorted = indexing(query, query_sort_idx)
+            # query_sorted = indexing(query, query_sort_idx)
             attn_block, lse_block = 0, 0
 
-        return attn_block, lse_block, query_sorted, key_sorted, value_sorted, query_block_size, key_block_size, query_sort_idx_inv
+        # Return reverse sort idxes for block mask generation
+        return attn_block, lse_block, query_block_size, key_block_size, query_sort_idx_inv, key_sort_idx_inv
 
     def attention_by_anns_pairing(self, query, key, value, scale):
         batch_size, head_size, n_query, dim = query.shape
@@ -366,7 +453,7 @@ class HyperAttention(torch.nn.Module):
 
         # 1. Significant correlation guided sampling
         if self.pairing_method == 'lsh':
-            attn_paired, lse_paired, query_, key_, value_, query_block_size, key_block_size, query_sort_idx_inv = self.attention_by_lsh_sort(query, key, value, scale)
+            attn_paired, lse_paired, query_, key_, value_, query_block_size, key_block_size, query_sort_idx_inv, key_sort_idx_inv = self.attention_by_lsh_sort(query, key, value, scale)
             block_sampled_set_view = None
         elif self.pairing_method == 'anns':
             query_block_size, key_block_size = self.block_size, self.block_size
@@ -376,7 +463,12 @@ class HyperAttention(torch.nn.Module):
         else:
             raise ValueError(f"Unknown pairing method: {self.pairing_method}")
 
-        # 2. Residual low-rank part via uniform sampling
+        # 2. Local sampling
+            # if self.apply_2d_local_sampling:
+                #TODO: implement the 2D local sampling
+
+
+        # 3. Residual low-rank part via uniform sampling
         # Sample indices uniformly at random
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > query_block_size) and (n_key > key_block_size):
@@ -406,7 +498,7 @@ class HyperAttention(torch.nn.Module):
             else:
                 attn_, lse_ = attn_res, lse_res
 
-        # 3. Significant sampling according to Value
+        # 4. Significant sampling according to Value
             value_norms = torch.norm(value_, dim=-1)
             _, topk_sampled_set = torch.topk(value_norms, self.sample_size, dim=-1, largest=True, sorted=False)
             topk_sampled_set.reshape(batch_size, head_size, sample_size)
@@ -433,10 +525,6 @@ class HyperAttention(torch.nn.Module):
 
             # Add only topk sampled residual attentions:
             attn_, lse_ = add_self_attentions(attn_, lse_, topk_attn_res, topk_lse_res)
-
-        # 4. Local sampling
-            # if self.apply_2d_local_sampling:
-                #TODO: implement the 2D local sampling
 
         # 5. Unseen part approximation
             weights = torch.clamp((n_key - sampled_cnt - topk_sampled_cnt - key_block_size) / (sampled_cnt + 1e-6), min=0.0) # weights >= 0.0
