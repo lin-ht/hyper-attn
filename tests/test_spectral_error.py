@@ -74,7 +74,7 @@ def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, b
 TEST_HYPER_ATTN_CONFIGS = [
     HyperAttentionConfig(
         input_dim=64,
-        lsh_num_projs=15,
+        lsh_num_projs=7,
         block_size=256,
         sample_size=256,
         min_seq_len=2048,
@@ -187,6 +187,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
         pairing_method=config.pairing_method,
         approximate_unsampled=config.approximate_unsampled,
         impl=config.impl).to(device='cuda', dtype=q.dtype)
+    # attn_hyper.treat_sequence_as_2d(1.0)
 
     a_hyper, lse_hyper = attn_hyper(q, k, v, causal=False, return_lse=True)
     s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_hyper, dim=-1, keepdim=True) + 1e-6)
