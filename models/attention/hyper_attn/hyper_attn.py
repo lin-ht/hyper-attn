@@ -471,15 +471,21 @@ class HyperAttention(torch.nn.Module):
         else:
             raise ValueError(f"Unknown pairing method: {self.pairing_method}")
 
+        # return attn_paired, lse_paired
+
         # 2. Local sampling
         if self.apply_2d_local_sampling:
             rst_local = self.attention_by_spatial_pairing(query, key, value, scale, self.aspect_ratio, lsh_query_sort_idx_inv, lsh_key_sort_idx_inv, lsh_query_block_size, lsh_key_block_size)
-            attn_local, lse_local, sampled_cnt_local, query_, key_, value_, local_query_block_size, local_key_block_size, local_query_sort_idx, local_key_sort_idx, local_key_sort_idx_inv, local_query_sort_idx_inv = rst_local
+            attn_local, lse_local, sampled_cnt_local, query_, key_, value_, local_query_block_size, local_key_block_size, local_query_sort_idx, local_key_sort_idx, local_query_sort_idx_inv, local_key_sort_idx_inv = rst_local
             # Follow the order of spatial pairing
             attn_paired = indexing(attn_paired, local_query_sort_idx)
             lse_paired = indexing(lse_paired, local_query_sort_idx)
 
-            attn_paired, lse_paired = add_self_attentions(attn_paired, lse_paired, attn_local, lse_local)
+            local_query_sort_idx_full = local_query_sort_idx.expand(batch_size, head_size, -1)
+            lsh_query_in_order = lsh_query_sort_idx_inv.gather(-1, local_query_sort_idx_full).view(batch_size, head_size, -1)
+
+            # attn_paired, lse_paired = add_self_attentions(attn_paired, lse_paired, attn_local, lse_local)
+            sampled_cnt_local = torch.zeros(1, device=query.device)
         else:
             local_query_block_size = -1
             local_key_block_size = -1
@@ -488,6 +494,8 @@ class HyperAttention(torch.nn.Module):
             local_query_sort_idx = torch.arange(n_query, device=key.device).reshape(1, 1, -1)
             local_key_sort_idx_inv = local_key_sort_idx
             local_query_sort_idx_inv = local_query_sort_idx
+
+            lsh_query_in_order = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
 
         # 3. Residual low-rank part via uniform sampling
         # Sample indices uniformly at random
@@ -504,16 +512,16 @@ class HyperAttention(torch.nn.Module):
                 block_mask = None
                 # Exclude samples already covered by diagonal blocks from local sampling
                 offset_n = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
-                if local_key_block_size > 0 and local_query_block_size > 0:
-                    # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
-                    block_mask = (offset_n // local_query_block_size) == (sampled_set // local_key_block_size).view(-1, 1, sample_size)
-                    block_mask = block_mask.view(-1, n_query, sample_size)
+                # if local_key_block_size > 0 and local_query_block_size > 0:
+                #     # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+                #     block_mask = (offset_n // local_query_block_size) == (sampled_set // local_key_block_size).view(-1, 1, sample_size)
+                #     block_mask = block_mask.view(-1, n_query, sample_size)
                 # Exclude samples already covered by diagonal blocks from lsh sorting
                 if lsh_key_block_size > 0 and lsh_query_block_size > 0:
                     tmp_2 = local_key_sort_idx.expand(batch_size, head_size, -1).view(batch_size, head_size, -1, 1)
-                    tmp_1 = indexing(tmp_2, sampled_set).view(batch_size, head_size, -1)
+                    tmp_1 = indexing(tmp_2, sampled_set).view(batch_size, head_size, -1)  # index in the original data
                     sampled_set_lsh = indexing(lsh_key_sort_idx_inv.view(batch_size, head_size, -1, 1), tmp_1).view(batch_size, head_size, -1)
-                    block_mask_lsh = (offset_n // lsh_query_block_size) == (sampled_set_lsh // lsh_key_block_size).view(-1, 1, sample_size)
+                    block_mask_lsh = (lsh_query_in_order.view(-1, n_query, 1) // lsh_query_block_size) == (sampled_set_lsh // lsh_key_block_size).view(-1, 1, sample_size)
                     block_mask_lsh = block_mask_lsh.view(-1, n_query, sample_size)
                     block_mask = block_mask | block_mask_lsh if block_mask is not None else block_mask_lsh
 
@@ -541,20 +549,27 @@ class HyperAttention(torch.nn.Module):
                 block_mask = None
                 # Exclude samples already covered by diagonal blocks from local sampling
                 offset_n = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
-                if local_key_block_size > 0 and local_query_block_size > 0:
-                    # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
-                    block_mask = (offset_n // local_query_block_size) == (topk_sampled_set // local_key_block_size).view(-1, 1, sample_size)
-                    block_mask = block_mask.view(-1, n_query, sample_size)
+                # if local_key_block_size > 0 and local_query_block_size > 0:
+                #     # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+                #     block_mask = (offset_n // local_query_block_size) == (topk_sampled_set // local_key_block_size).view(-1, 1, sample_size)
+                #     block_mask = block_mask.view(-1, n_query, sample_size)
 
                 # Exclude samples already covered by diagonal blocks from lsh sorting
                 if lsh_key_block_size > 0 and lsh_query_block_size > 0:
                     tmp_2 = local_key_sort_idx.expand(batch_size, head_size, -1).view(batch_size, head_size, -1, 1)
                     tmp_1 = indexing(tmp_2, topk_sampled_set).view(batch_size, head_size, -1)
                     sampled_set_lsh = indexing(lsh_key_sort_idx_inv.view(batch_size, head_size, -1, 1), tmp_1).view(batch_size, head_size, -1)
-
-                    block_mask_lsh = (offset_n // lsh_query_block_size) == (sampled_set_lsh // lsh_key_block_size).view(-1, 1, sample_size)
+                    block_mask_lsh = (lsh_query_in_order.view(-1, n_query, 1) // lsh_query_block_size) == (sampled_set_lsh // lsh_key_block_size).view(-1, 1, sample_size)
                     block_mask_lsh = block_mask_lsh.view(-1, n_query, sample_size)
                     block_mask = block_mask | block_mask_lsh if block_mask is not None else block_mask_lsh
+
+                # Exclude samples already covered by uniform sampling
+                double_sampled = torch.zeros_like(topk_sampled_set, dtype=torch.bool)
+                for i in range(double_sampled.shape[0]):
+                    for j in range(double_sampled.shape[1]):
+                        sampled_set_j = sampled_set[i, j, :]
+                        double_sampled[i, j, :] = torch.isin(topk_sampled_set[i, j, :], sampled_set_j, assume_unique=True).view(1, 1, sample_size)
+                block_mask = block_mask | double_sampled.view(-1, 1, sample_size) if block_mask is not None else double_sampled
 
                 block_mask, topk_sampled_cnt = self.finalize_block_mask(batch_size, head_size, sample_size, query_.dtype, block_mask)
                 topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=block_mask)
