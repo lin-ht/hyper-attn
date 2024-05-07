@@ -13,8 +13,8 @@ class AngularLSH(torch.nn.Module):
             self.register_buffer('proj_dir', torch.randn(dim + (num_projs,), generator=rng), persistent=False)
             # Fixme: this seems to be a bug, perm should be a mapping from hash code to angular hash index.
             # perm is the angular hamming code sequence arranged in order
-            # self.register_buffer('perm', self._unit_hamming_distance_array(self.num_projs), persistent=False)
-            self.register_buffer('perm', self._hamming_code_to_order_mapping_perm(self.num_projs), persistent=False)
+            self.register_buffer('perm', self._unit_hamming_distance_array(self.num_projs), persistent=False)
+            # self.register_buffer('perm', self._hamming_code_to_order_mapping_perm(self.num_projs), persistent=False)
             # self.register_buffer('perm', torch.randperm(2 ** num_projs), persistent=False)
             # Example: num_projs=4, enc_vec=[[[[1, 2, 4, 8]]]]
             self.register_buffer('enc_vec', 2 ** torch.arange(self.num_projs).view(1, 1, 1, -1), persistent=False)
@@ -79,3 +79,11 @@ class AngularLSH(torch.nn.Module):
 
     def __repr__(self):
         return f"AngularLSH(num_proj={self.num_projs}, proj_dir.shape={self.proj_dir.shape})"
+
+
+if __name__ == "__main__":
+    a = AngularLSH(7, (1, 1, 64))
+    t1 = a._hamming_code_to_order_mapping(7)
+    t2 = a._hamming_code_to_order_mapping_perm(7)
+    t = torch.all(t1 == t2)
+    assert t, "Failed to test AngularLSH._hamming_code_to_order_mapping_perm"
