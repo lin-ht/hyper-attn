@@ -80,7 +80,7 @@ TEST_HYPER_ATTN_CONFIGS = [
         min_seq_len=2048,
         pairing_method='lsh',
         # pairing_method='anns',
-        approximate_unsampled=False,
+        approximate_unsampled=True,
         impl='xformers'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='cuda'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='triton'),
@@ -129,6 +129,8 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     if do_calculation:
         a_calc, a, d = calculate_attn(q, k, v, softmax_scale)
+    else:
+        a_calc = None
 
     a_exact, _ = exact_attention_xformers(q, k, v, softmax_scale)
     a_exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
@@ -187,6 +189,7 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
         pairing_method=config.pairing_method,
         approximate_unsampled=config.approximate_unsampled,
         impl=config.impl).to(device='cuda', dtype=q.dtype)
+    # attn_hyper.treat_sequence_as_2d(1.0)
 
     a_hyper, lse_hyper = attn_hyper(q, k, v, causal=False, return_lse=True)
     s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_hyper, dim=-1, keepdim=True) + 1e-6)
@@ -219,6 +222,23 @@ def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim
 
     log_prefix = "============ Compare results with input k, k, v ============"
     compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
+    log_prefix = "============ Compare results with input q, k, v ============"
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
+    return q, k, v, max_spectral_error_ratio
+
+
+@pytest.mark.parametrize("config", TEST_HYPER_ATTN_CONFIGS)
+@pytest.mark.parametrize("path", ["tests/data/"])
+def test_with_real_data(config, path):
+    torch.manual_seed(42)
+    ord = 'fro'
+    softmax_scale = 1.0
+
+    q = torch.permute(torch.load(path + "q.pt"), (0, 2, 1, 3))
+    k = torch.permute(torch.load(path + "k.pt"), (0, 2, 1, 3))
+    v = torch.permute(torch.load(path + "v.pt"), (0, 2, 1, 3))
+    print(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
+
     log_prefix = "============ Compare results with input q, k, v ============"
     a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
     return q, k, v, max_spectral_error_ratio
@@ -320,5 +340,6 @@ def compute_error_ratio(diff_attn, diff_lse, exact_attn, exact_lse, ord='fro', l
 
 if __name__ == "__main__":
     # pytest.main([__file__])
-    test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
+    test_with_real_data(TEST_HYPER_ATTN_CONFIGS[0], "tests/data/")
+    # test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
     # test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))

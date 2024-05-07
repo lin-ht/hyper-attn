@@ -37,7 +37,7 @@ class HyperAttention(torch.nn.Module):
         self.impl = impl
         self.approximate_unsampled = approximate_unsampled
         if self.pairing_method == 'lsh':
-            self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim + 1))  # dim: (heads, seq_len, query/key_dim)
+            self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
         else:
             self.anns = AnnsHNSW(sample_size=self.block_size)
 
