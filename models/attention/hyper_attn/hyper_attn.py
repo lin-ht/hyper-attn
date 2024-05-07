@@ -36,7 +36,7 @@ class HyperAttention(torch.nn.Module):
         self.impl = impl
         self.approximate_unsampled = approximate_unsampled
 
-        self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim + 1))  # dim: (heads, seq_len, query/key_dim)
+        self.lsh = AngularLSH(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))  # dim: (heads, seq_len, query/key_dim)
 
         if impl == 'xformers':
             self.exact_attn = exact_attention_xformers
