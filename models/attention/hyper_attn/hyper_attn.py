@@ -10,7 +10,6 @@ from attention.hyper_attn.utils import (
     indexing,
 )
 from attention.hyper_attn.angular_lsh import AngularLSH
-from attention.hyper_attn.anns_hnsw import AnnsHNSW
 
 class HyperAttention(torch.nn.Module):
 
@@ -49,7 +48,6 @@ class HyperAttention(torch.nn.Module):
     def treat_sequence_as_2d(self, aspect_ratio: float):
         self.apply_2d_local_sampling = True
         self.aspect_ratio = aspect_ratio
-
 
     def forward(self, query: torch.tensor, key: torch.tensor, value: torch.tensor, scale=None, causal=False, return_lse=False):
         query = query.contiguous()
@@ -355,7 +353,7 @@ class HyperAttention(torch.nn.Module):
                 block_mask, sampled_cnt_rand = self.finalize_block_mask(batch_size, head_size, sample_size, query_.dtype, block_mask)
                 attn_res, lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
-                sampled_cnt_rand = torch.ones(1) * sample_size
+                sampled_cnt_rand = torch.ones(1, device=query.device) * sample_size
                 attn_res, lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False)
 
             # Add only sampled residual attentions:
@@ -401,7 +399,7 @@ class HyperAttention(torch.nn.Module):
                 block_mask, topk_sampled_cnt = self.finalize_block_mask(batch_size, head_size, sample_size, query_.dtype, block_mask)
                 topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
-                topk_sampled_cnt = torch.ones(1) * sample_size
+                topk_sampled_cnt = torch.ones(1, device=query.device) * sample_size
                 topk_attn_res, topk_lse_res = self.exact_attn(query_, key_subset, value_subset, scale, causal=False)
 
             # Add only topk sampled residual attentions:

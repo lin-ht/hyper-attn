@@ -129,6 +129,8 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 
     if do_calculation:
         a_calc, a, d = calculate_attn(q, k, v, softmax_scale)
+    else:
+        a_calc = None
 
     a_exact, _ = exact_attention_xformers(q, k, v, softmax_scale)
     a_exact_norm = torch.linalg.matrix_norm(a_exact, ord=ord)
@@ -222,6 +224,23 @@ def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim
     compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
     log_prefix = "============ Compare results with input q, k, v ============"
     a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
+    return q, k, v, max_spectral_error_ratio
+
+
+@pytest.mark.parametrize("config", TEST_HYPER_ATTN_CONFIGS)
+@pytest.mark.parametrize("path", ["tests/data/"])
+def test_with_real_data(config, path):
+    torch.manual_seed(42)
+    ord = 'fro'
+    softmax_scale = 1.0
+
+    q = torch.permute(torch.load(path + "q.pt"), (0, 2, 1, 3))
+    k = torch.permute(torch.load(path + "k.pt"), (0, 2, 1, 3))
+    v = torch.permute(torch.load(path + "v.pt"), (0, 2, 1, 3))
+    print(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
+
+    log_prefix = "============ Compare results with input q, k, v ============"
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = False, log_prefix=log_prefix)
     return q, k, v, max_spectral_error_ratio
 
 
@@ -321,5 +340,6 @@ def compute_error_ratio(diff_attn, diff_lse, exact_attn, exact_lse, ord='fro', l
 
 if __name__ == "__main__":
     # pytest.main([__file__])
-    test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
+    test_with_real_data(TEST_HYPER_ATTN_CONFIGS[0], "tests/data/")
+    # test_get_tensors_and_error_ratio(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
     # test_spectral_error(TEST_HYPER_ATTN_CONFIGS[0], *(TEST_CASES[0]))
