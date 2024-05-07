@@ -471,17 +471,24 @@ class HyperAttention(torch.nn.Module):
         else:
             raise ValueError(f"Unknown pairing method: {self.pairing_method}")
 
-        # return attn_paired, lse_paired
-
         # 2. Local sampling
         if self.apply_2d_local_sampling:
             rst_local = self.attention_by_spatial_pairing(query, key, value, scale, self.aspect_ratio, lsh_query_sort_idx_inv, lsh_key_sort_idx_inv, lsh_query_block_size, lsh_key_block_size)
             attn_local, lse_local, sampled_cnt_local, query_, key_, value_, local_query_block_size, local_key_block_size, local_query_sort_idx, local_key_sort_idx, local_query_sort_idx_inv, local_key_sort_idx_inv = rst_local
-            # Follow the order of spatial pairing
-            attn_paired = indexing(attn_paired, local_query_sort_idx)
-            lse_paired = indexing(lse_paired, local_query_sort_idx)
 
+            # local_query_block_size = 256
+            # local_key_block_size = 256
+            # query_, key_, value_ = query, key, value
+            # local_key_sort_idx = torch.arange(n_key, device=key.device).reshape(1, 1, -1)
+            # local_query_sort_idx = torch.arange(n_query, device=key.device).reshape(1, 1, -1)
+            # local_query_sort_idx_inv = local_query_sort_idx
+            # local_key_sort_idx_inv = local_key_sort_idx
+
+            # Follow the order of spatial pairing
             local_query_sort_idx_full = local_query_sort_idx.expand(batch_size, head_size, -1)
+            attn_paired = indexing(attn_paired, local_query_sort_idx_full)
+            lse_paired = indexing(lse_paired, local_query_sort_idx_full)
+
             lsh_query_in_order = lsh_query_sort_idx_inv.gather(-1, local_query_sort_idx_full).view(batch_size, head_size, -1)
 
             # attn_paired, lse_paired = add_self_attentions(attn_paired, lse_paired, attn_local, lse_local)
@@ -489,6 +496,9 @@ class HyperAttention(torch.nn.Module):
         else:
             local_query_block_size = -1
             local_key_block_size = -1
+            # local_query_block_size = 256
+            # local_key_block_size = 256
+            # query_, key_, value_ = query, key, value
             sampled_cnt_local = torch.zeros(1, device=query.device)
             local_key_sort_idx = torch.arange(n_key, device=key.device).reshape(1, 1, -1)
             local_query_sort_idx = torch.arange(n_query, device=key.device).reshape(1, 1, -1)
@@ -502,8 +512,11 @@ class HyperAttention(torch.nn.Module):
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > lsh_query_block_size) and (n_key > lsh_key_block_size):
             # Hack to have same probability for each key column
-            sample_prob = torch.ones(1, device=query_.device).as_strided_((batch_size * head_size, n_key), (0, 0))
-            sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
+            # sample_prob = torch.ones(1, device=query_.device).as_strided_((batch_size * head_size, n_key), (0, 0))
+            # sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
+            sampled_set = (local_key_sort_idx_inv[0,0,:sample_size]).reshape(1,1,-1)
+            sampled_set[0,0,sample_size-1] = local_key_sort_idx_inv[0,0,sample_size]
+            sampled_set = sampled_set.expand(batch_size, head_size, sample_size)
             value_subset = indexing(value_, sampled_set)
             key_subset = indexing(key_, sampled_set)
 
@@ -595,6 +608,6 @@ class HyperAttention(torch.nn.Module):
         # if local_query_sort_idx_inv is not None:
         if self.apply_2d_local_sampling:
             # Re-order rows with the inverse order for query_sorted -> query
-            attn = indexing(attn, local_query_sort_idx_inv)
-            lse = indexing(lse, local_query_sort_idx_inv)
+            attn = indexing(attn, local_query_sort_idx_inv.expand(batch_size, head_size, -1))
+            lse = indexing(lse, local_query_sort_idx_inv.expand(batch_size, head_size, -1))
         return attn, lse
