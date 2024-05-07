@@ -491,8 +491,8 @@ class HyperAttention(torch.nn.Module):
 
             lsh_query_in_order = lsh_query_sort_idx_inv.gather(-1, local_query_sort_idx_full).view(batch_size, head_size, -1)
 
-            # attn_paired, lse_paired = add_self_attentions(attn_paired, lse_paired, attn_local, lse_local)
-            sampled_cnt_local = torch.zeros(1, device=query.device)
+            attn_paired, lse_paired = add_self_attentions(attn_paired, lse_paired, attn_local, lse_local)
+            # sampled_cnt_local = torch.zeros(1, device=query.device)
         else:
             local_query_block_size = -1
             local_key_block_size = -1
@@ -512,10 +512,10 @@ class HyperAttention(torch.nn.Module):
         sample_size = self.sample_size
         if sample_size > 0 and (n_query > lsh_query_block_size) and (n_key > lsh_key_block_size):
             # Hack to have same probability for each key column
-            # sample_prob = torch.ones(1, device=query_.device).as_strided_((batch_size * head_size, n_key), (0, 0))
-            # sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
-            sampled_set = (local_key_sort_idx_inv[0,0,:sample_size]).reshape(1,1,-1)
-            sampled_set[0,0,sample_size-1] = local_key_sort_idx_inv[0,0,sample_size]
+            sample_prob = torch.ones(1, device=query_.device).as_strided_((batch_size * head_size, n_key), (0, 0))
+            sampled_set = torch.multinomial(sample_prob, sample_size, replacement=False).reshape(batch_size, head_size, sample_size)
+            # sampled_set = (local_key_sort_idx_inv[0,0,:sample_size]).reshape(1,1,-1)
+            # sampled_set[0,0,sample_size-1] = local_key_sort_idx_inv[0,0,sample_size]
             sampled_set = sampled_set.expand(batch_size, head_size, sample_size)
             value_subset = indexing(value_, sampled_set)
             key_subset = indexing(key_, sampled_set)
@@ -525,10 +525,10 @@ class HyperAttention(torch.nn.Module):
                 block_mask = None
                 # Exclude samples already covered by diagonal blocks from local sampling
                 offset_n = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
-                # if local_key_block_size > 0 and local_query_block_size > 0:
-                #     # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
-                #     block_mask = (offset_n // local_query_block_size) == (sampled_set // local_key_block_size).view(-1, 1, sample_size)
-                #     block_mask = block_mask.view(-1, n_query, sample_size)
+                if local_key_block_size > 0 and local_query_block_size > 0:
+                    # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+                    block_mask = (offset_n // local_query_block_size) == (sampled_set // local_key_block_size).view(-1, 1, sample_size)
+                    block_mask = block_mask.view(-1, n_query, sample_size)
                 # Exclude samples already covered by diagonal blocks from lsh sorting
                 if lsh_key_block_size > 0 and lsh_query_block_size > 0:
                     tmp_2 = local_key_sort_idx.expand(batch_size, head_size, -1).view(batch_size, head_size, -1, 1)
@@ -562,10 +562,10 @@ class HyperAttention(torch.nn.Module):
                 block_mask = None
                 # Exclude samples already covered by diagonal blocks from local sampling
                 offset_n = torch.arange(n_query, device=query_.device).reshape(1, -1, 1)
-                # if local_key_block_size > 0 and local_query_block_size > 0:
-                #     # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
-                #     block_mask = (offset_n // local_query_block_size) == (topk_sampled_set // local_key_block_size).view(-1, 1, sample_size)
-                #     block_mask = block_mask.view(-1, n_query, sample_size)
+                if local_key_block_size > 0 and local_query_block_size > 0:
+                    # Final block_mask is a 4d-tensor with shape [batch_size * head_size, n_query, sample_size]
+                    block_mask = (offset_n // local_query_block_size) == (topk_sampled_set // local_key_block_size).view(-1, 1, sample_size)
+                    block_mask = block_mask.view(-1, n_query, sample_size)
 
                 # Exclude samples already covered by diagonal blocks from lsh sorting
                 if lsh_key_block_size > 0 and lsh_query_block_size > 0:
