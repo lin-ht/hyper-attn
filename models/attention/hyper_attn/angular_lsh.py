@@ -13,8 +13,8 @@ class AngularLSH(torch.nn.Module):
             self.register_buffer('proj_dir', torch.randn(dim + (num_projs,), generator=rng), persistent=False)
             # Fixme: this seems to be a bug, perm should be a mapping from hash code to angular hash index.
             # perm is the angular hamming code sequence arranged in order
-            # self.register_buffer('perm', self._unit_hamming_distance_array(self.num_projs), persistent=False)
-            self.register_buffer('perm', self._hamming_code_to_order_mapping_perm(self.num_projs), persistent=False)
+            self.register_buffer('perm', self._unit_hamming_distance_array(self.num_projs), persistent=False)
+            # self.register_buffer('perm', self._hamming_code_to_order_mapping_perm(self.num_projs), persistent=False)
             # self.register_buffer('perm', torch.randperm(2 ** num_projs), persistent=False)
             # Example: num_projs=4, enc_vec=[[[[1, 2, 4, 8]]]]
             self.register_buffer('enc_vec', 2 ** torch.arange(self.num_projs).view(1, 1, 1, -1), persistent=False)

@@ -80,7 +80,7 @@ TEST_HYPER_ATTN_CONFIGS = [
         min_seq_len=2048,
         pairing_method='lsh',
         # pairing_method='anns',
-        approximate_unsampled=False,
+        approximate_unsampled=True,
         impl='xformers'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='cuda'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='triton'),
