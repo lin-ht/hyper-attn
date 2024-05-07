@@ -74,7 +74,7 @@ def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, b
 TEST_HYPER_ATTN_CONFIGS = [
     HyperAttentionConfig(
         input_dim=64,
-        lsh_num_projs=15,
+        lsh_num_projs=7,
         block_size=256,
         sample_size=256,
         min_seq_len=2048,
