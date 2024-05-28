@@ -71,7 +71,7 @@ def add_scaled_self_attentions(attn1, lse1, s1, attn2, lse2, s2):
     inputs:
         - attn1, attn2: 4d-tensors with shape [b, h, n, d]
         - lse1, lse2: 4d-tensors of log-sum-exp with shape [b, h, n, 1]
-        - s1, s2: tensors of relative scales (>0) with shape [b, h, n] or [b, h]
+        - s1, s2: 4d-tensors of relative scales (>0) with shape [b, h, n, 1]
     output:
         - same as add_self_attentions(attn1, lse1+log(s1), attn2, lse2+log(s2))
     """
