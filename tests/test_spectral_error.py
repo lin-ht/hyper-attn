@@ -1,18 +1,30 @@
+import math
 import time
-import torch
-import pytest
 
-from attention.hyper_attn.hyper_attn_org import HyperAttention as HyperAttentionOrg
+import matplotlib.pyplot as plt
+import pytest
+import torch
 from attention.hyper_attn.hyper_attn import HyperAttention
+from attention.hyper_attn.hyper_attn_org import HyperAttention as HyperAttentionOrg
 from attention.hyper_attn.utils import (
-    exact_attention_xformers,
     exact_attention_cuda,
-    exact_attention,
+    exact_attention_xformers,
 )
 from xformers.ops import fmha
 
+
 class HyperAttentionConfig:
-    def __init__(self, input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=4096, pairing_method='lsh', approximate_unsampled=True, impl='xformers'):
+    def __init__(
+        self,
+        input_dim=64,
+        lsh_num_projs=7,
+        block_size=256,
+        sample_size=256,
+        min_seq_len=4096,
+        pairing_method="lsh",
+        approximate_unsampled=True,
+        impl="xformers",
+    ):
         self.input_dim = input_dim
         self.lsh_num_projs = lsh_num_projs
         self.block_size = block_size
@@ -22,38 +34,68 @@ class HyperAttentionConfig:
         self.approximate_unsampled = approximate_unsampled
         self.impl = impl
 
-def random_array(shape, dtype=torch.bfloat16, device="cuda", requires_grad:bool=False):
+
+def random_array(
+    shape, dtype=torch.bfloat16, device="cuda", requires_grad: bool = False
+):
     return torch.randn(shape, dtype=dtype, device=device, requires_grad=requires_grad)
     # return torch.rand(shape, dtype=dtype, device=device, requires_grad=requires_grad) * 2 - 1.0
 
-def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, block_size:int=4, noise_scale:float=0.01, permute:bool=True):
+
+def get_tensors(
+    batch_size,
+    head_size,
+    seq_len,
+    dim,
+    requires_grad: bool = False,
+    block_size: int = 4,
+    noise_scale: float = 0.01,
+    permute: bool = True,
+):
     if block_size <= 0:
-        q = random_array((batch_size, head_size, seq_len, dim), requires_grad=requires_grad)
-        k = random_array((batch_size, head_size, seq_len, dim), requires_grad=requires_grad)
-        v = random_array((batch_size, head_size, seq_len, dim), requires_grad=requires_grad)
+        q = random_array(
+            (batch_size, head_size, seq_len, dim), requires_grad=requires_grad
+        )
+        k = random_array(
+            (batch_size, head_size, seq_len, dim), requires_grad=requires_grad
+        )
+        v = random_array(
+            (batch_size, head_size, seq_len, dim), requires_grad=requires_grad
+        )
     else:
         start_time = time.time()
         n_bases = block_size
         n_blocks = (seq_len + n_bases - 1) // n_bases
         seq_len_sup = n_blocks * n_bases
         n_padding = seq_len_sup - seq_len
-        k_sup = random_array((batch_size, head_size, seq_len_sup, dim), requires_grad=requires_grad)
+        k_sup = random_array(
+            (batch_size, head_size, seq_len_sup, dim), requires_grad=requires_grad
+        )
         if n_padding > 0:
-            k_sup[:, :, seq_len:, :] = k_sup[:, :, seq_len-n_padding:seq_len, :]
+            k_sup[:, :, seq_len:, :] = k_sup[:, :, seq_len - n_padding : seq_len, :]
 
-        s = torch.rand((batch_size, head_size, seq_len, n_bases), dtype=torch.bfloat16, device="cuda", requires_grad=requires_grad)
+        s = torch.rand(
+            (batch_size, head_size, seq_len, n_bases),
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=requires_grad,
+        )
         s[:, :, :, 0] += 1e-6
         s = s / s.sum(dim=-1, keepdim=True)
 
-        q_ = noise_scale * random_array((batch_size, head_size, seq_len, dim), requires_grad=requires_grad)
+        q_ = noise_scale * random_array(
+            (batch_size, head_size, seq_len, dim), requires_grad=requires_grad
+        )
         k_sup_view = k_sup.view(batch_size, head_size, n_blocks, n_bases, dim)
         for i in range(n_blocks):
-            s_block = s[:, :, i*n_bases:i*n_bases+n_bases, :]
+            s_block = s[:, :, i * n_bases : i * n_bases + n_bases, :]
             k_sup_view_block = k_sup_view[:, :, i, :, :]
             q_block = torch.einsum("bhmn,bhnk->bhmk", s_block, k_sup_view_block)
-            q_[:, :, i*n_bases:i*n_bases+n_bases, :] += q_block
+            q_[:, :, i * n_bases : i * n_bases + n_bases, :] += q_block
 
-        v = random_array((batch_size, head_size, seq_len, dim), requires_grad=requires_grad)
+        v = random_array(
+            (batch_size, head_size, seq_len, dim), requires_grad=requires_grad
+        )
         # Apply random permutation:
         if permute:
             q = torch.zeros_like(q_)
@@ -71,6 +113,7 @@ def get_tensors(batch_size, head_size, seq_len, dim, requires_grad:bool=False, b
 
     return q, k, v
 
+
 TEST_HYPER_ATTN_CONFIGS = [
     HyperAttentionConfig(
         input_dim=64,
@@ -78,10 +121,11 @@ TEST_HYPER_ATTN_CONFIGS = [
         block_size=256,
         sample_size=256,
         min_seq_len=2048,
-        pairing_method='lsh',
+        pairing_method="lsh",
         # pairing_method='anns',
         approximate_unsampled=True,
-        impl='xformers'),
+        impl="xformers",
+    ),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='cuda'),
     # HyperAttentionConfig(input_dim=64, lsh_num_projs=7, block_size=256, sample_size=256, min_seq_len=2048, approximate_unsampled=False, impl='triton'),
 ]
@@ -95,36 +139,61 @@ TEST_CASES = [
 ]
 
 
-def calculate_attn(q, k, v, softmax_scale, bias=None):
-    batch_size, head_size, seq_len, dim = q.shape # BMHK format
+def calculate_attn(
+    q, k, v, softmax_scale, bias=None, save_plot_ids=[2**i - 1 for i in range(0, 15, 1)]
+):
+    batch_size, head_size, seq_len, dim = q.shape  # BMHK format
     n_key = k.shape[-2]  # Mostly n_key = seq_len
 
     if seq_len > 2**14:
         print(f"Skip calculate_attn for seq_len={seq_len}")
         return None, None, None
 
-    q_ = q.reshape(batch_size*head_size, -1, dim)
-    k_ = k.permute(0, 1, 3, 2).reshape(batch_size*head_size, dim, -1)
+    q_ = q.reshape(batch_size * head_size, -1, dim)
+    k_ = k.permute(0, 1, 3, 2).reshape(batch_size * head_size, dim, -1)
 
     # w[b,i,j]=sum_c q[b,i,_c]k[b,_c,j]
     w_ = torch.bmm(q_, k_) * softmax_scale  # (batch_size * head_size, seq_len, n_key)
     if bias is not None:
         w_ += bias
 
+    if save_plot_ids.__len__() > 0:
+        side = int(math.sqrt(n_key))
+        assert side * side == n_key, f"n_key({n_key}) is not a square number"
+        for i in save_plot_ids:
+            if i >= 0 and i < n_key:
+                # img = torch.clamp(w_[0, i, :].reshape([side, side]), min=-1.0, max=1.0)
+                img = w_[0, i, :].reshape([side, side])
+                fig = plt.figure()
+                ax = fig.add_subplot(111)
+                cax = ax.matshow(img.cpu().numpy(), interpolation="nearest")
+                fig.colorbar(cax)
+                plt.title(f"Attention weights for query {i}")
+                plt.show()
+                plt.savefig(f"./tests/data/w_{i}.png")
+
     d_ = torch.exp(w_).sum(dim=-1, keepdim=False)  # (batch_size * head_size, seq_len)
     a_ = torch.nn.functional.softmax(w_, dim=-1)
 
     # attn[b,i,j]=sum_c v[b,i,_c]a[b,_c,j]
-    v_ = v.permute(0, 1, 3, 2).reshape(batch_size*head_size, dim, -1)  # (batch_size*head_size, dim, n_key)
+    v_ = v.permute(0, 1, 3, 2).reshape(
+        batch_size * head_size, dim, -1
+    )  # (batch_size*head_size, dim, n_key)
     # a_.permute(0, 2, 1) is (batch_size * head_size, n_key, seq_len)
-    attn = torch.bmm(v_, a_.permute(0, 2, 1)).permute(0, 2, 1).reshape(batch_size, head_size, -1, dim)  # (batch_size, head_size, seq_len, dim)
+    attn = (
+        torch.bmm(v_, a_.permute(0, 2, 1))
+        .permute(0, 2, 1)
+        .reshape(batch_size, head_size, -1, dim)
+    )  # (batch_size, head_size, seq_len, dim)
 
     return attn, a_.reshape(batch_size, head_size, seq_len, n_key), d_
 
 
-def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = False, log_prefix=""):
+def compare_attn(
+    q, k, v, softmax_scale, config, ord="fro", do_calculation=False, log_prefix=""
+):
     block_size = config.block_size
-    batch_size, head_size, seq_len, dim = q.shape # BMHK format
+    batch_size, head_size, seq_len, dim = q.shape  # BMHK format
     n_key = k.shape[-2]  # Mostly n_key = seq_len
 
     if do_calculation:
@@ -142,16 +211,20 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
     block_mask = fmha.BlockDiagonalMask.from_seqlens(block_size_list)
 
     # Batch size is required to be 1 when applying block_mask in xformers.
-    q_ = q.reshape(1, batch_size*head_size, -1, dim)
-    k_ = k.reshape(1, batch_size*head_size, -1, dim)
-    v_ = v.reshape(1, batch_size*head_size, -1, dim)
+    q_ = q.reshape(1, batch_size * head_size, -1, dim)
+    k_ = k.reshape(1, batch_size * head_size, -1, dim)
+    v_ = v.reshape(1, batch_size * head_size, -1, dim)
 
     a_block, _ = exact_attention_xformers(q_, k_, v_, softmax_scale, bias=block_mask)
     a_block = a_block.reshape(batch_size, head_size, seq_len, dim)
 
-    print(f"{log_prefix}\ncompare_attn: seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}")
+    print(
+        f"{log_prefix}\ncompare_attn: seq_len: {seq_len:<8}, block_size: {block_size}, dim: {dim:<8}, ord: {ord}"
+    )
     print(f"{a_exact.shape}\na_exact[0, 0, 0:2, :] = \n{a_exact[0, 0, 0:2, :]}")
-    print(f"Its exact data stats are (mean:{a_exact_m.item():.5f}, std:{a_exact_std.item():.5f})\n")
+    print(
+        f"Its exact data stats are (mean:{a_exact_m.item():.5f}, std:{a_exact_std.item():.5f})\n"
+    )
 
     if a_calc is not None:
         diff = a_exact - a_calc
@@ -162,11 +235,17 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
         print(f"a_calc[0, 0, 0:2, :] = \n{a_calc[0, 0, 0:2, :]}")
         print("------------ a_calc ------------")
         print(f"For a_calc max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
-        print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n")
+        print(
+            f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n"
+        )
 
-    s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_block, dim=-1, keepdim=True) + 1e-6)
+    s = torch.norm(a_exact, dim=-1, keepdim=True) / (
+        torch.norm(a_block, dim=-1, keepdim=True) + 1e-6
+    )
     diff_a = a_exact - a_block * s
-    diff_a_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
+    diff_a_norm = torch.linalg.matrix_norm(
+        diff_a, ord=ord
+    )  # By default: dim = (-2, -1)
     spectral_error_ratio = diff_a_norm / a_exact_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
     diff_std, diff_m = torch.std_mean(diff_a.reshape(-1), dim=0)
@@ -174,27 +253,43 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_block ------------")
     print(f"For a_block max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
-    print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n")
+    print(
+        f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})\n"
+    )
 
     if config.input_dim != dim:
-        print(f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim")
+        print(
+            f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim"
+        )
         config.input_dim = dim
 
-    attn_hyper = HyperAttention(
+    attn_hyper = HyperAttentionOrg(
         input_dim=dim,  # config.input_dim == dim
         lsh_num_projs=config.lsh_num_projs,
         block_size=config.block_size,
         sample_size=config.sample_size,
         min_seq_len=config.min_seq_len,
-        pairing_method=config.pairing_method,
-        approximate_unsampled=config.approximate_unsampled,
-        impl=config.impl).to(device='cuda', dtype=q.dtype)
+        impl=config.impl,
+    ).to(device="cuda", dtype=q.dtype)
+    # attn_hyper = HyperAttention(
+    #     input_dim=dim,  # config.input_dim == dim
+    #     lsh_num_projs=config.lsh_num_projs,
+    #     block_size=config.block_size,
+    #     sample_size=config.sample_size,
+    #     min_seq_len=config.min_seq_len,
+    #     pairing_method=config.pairing_method,
+    #     approximate_unsampled=config.approximate_unsampled,
+    #     impl=config.impl).to(device='cuda', dtype=q.dtype)
     # attn_hyper.treat_sequence_as_2d(1.0)
 
     a_hyper, lse_hyper = attn_hyper(q, k, v, causal=False, return_lse=True)
-    s = torch.norm(a_exact, dim=-1, keepdim=True) / (torch.norm(a_hyper, dim=-1, keepdim=True) + 1e-6)
-    diff_a = a_exact - a_hyper # * s
-    diff_a_norm = torch.linalg.matrix_norm(diff_a, ord=ord)  # By default: dim = (-2, -1)
+    s = torch.norm(a_exact, dim=-1, keepdim=True) / (
+        torch.norm(a_hyper, dim=-1, keepdim=True) + 1e-6
+    )
+    diff_a = a_exact - a_hyper  # * s
+    diff_a_norm = torch.linalg.matrix_norm(
+        diff_a, ord=ord
+    )  # By default: dim = (-2, -1)
     spectral_error_ratio = diff_a_norm / a_exact_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
     diff_std, diff_m = torch.std_mean(diff_a.reshape(-1), dim=0)
@@ -202,8 +297,12 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
     print(f"scales[0, 0, 0:16, :] = \n{s[0, 0, 0:16, :].squeeze_()}")
     print("------------ a_hyper ------------")
     print(f"For a_hyper max_spectral_error_ratio is {max_spectral_error_ratio:.5f}")
-    print(f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})")
-    print(f"Its exact data stats are (mean:{a_exact_m.item():.5f}, std:{a_exact_std.item():.5f})\n\n")
+    print(
+        f"Its diff std_mean stats are (mean:{diff_m.item():.5f}, std:{diff_std.item():.5f})"
+    )
+    print(
+        f"Its exact data stats are (mean:{a_exact_m.item():.5f}, std:{a_exact_std.item():.5f})\n\n"
+    )
 
     return a_exact, a_block, max_spectral_error_ratio
 
@@ -212,18 +311,32 @@ def compare_attn(q, k, v, softmax_scale, config, ord="fro", do_calculation = Fal
 @pytest.mark.parametrize(
     ["batch_size", "head_size", "seq_len", "dim", "causal"], TEST_CASES
 )
-def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim, causal):
+def test_get_tensors_and_error_ratio(
+    config, batch_size, head_size, seq_len, dim, causal
+):
     torch.manual_seed(42)
-    ord = 'fro'
+    ord = "fro"
     softmax_scale = dim ** (-0.5)
 
     co_size = min(config.block_size, 4)
-    q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=False)
+    q, k, v = get_tensors(
+        batch_size=batch_size,
+        head_size=head_size,
+        seq_len=seq_len,
+        dim=dim,
+        block_size=co_size,
+        noise_scale=0.01,
+        permute=False,
+    )
 
     log_prefix = "============ Compare results with input k, k, v ============"
-    compare_attn(k, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
+    compare_attn(
+        k, k, v, softmax_scale, config, do_calculation=True, log_prefix=log_prefix
+    )
     log_prefix = "============ Compare results with input q, k, v ============"
-    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = True, log_prefix=log_prefix)
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(
+        q, k, v, softmax_scale, config, do_calculation=True, log_prefix=log_prefix
+    )
     return q, k, v, max_spectral_error_ratio
 
 
@@ -231,7 +344,7 @@ def test_get_tensors_and_error_ratio(config, batch_size, head_size, seq_len, dim
 @pytest.mark.parametrize("path", ["tests/data/"])
 def test_with_real_data(config, path):
     torch.manual_seed(42)
-    ord = 'fro'
+    ord = "fro"
     softmax_scale = 1.0
 
     q = torch.permute(torch.load(path + "q.pt"), (0, 2, 1, 3))
@@ -240,7 +353,9 @@ def test_with_real_data(config, path):
     print(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
 
     log_prefix = "============ Compare results with input q, k, v ============"
-    a_exact, a_block, max_spectral_error_ratio = compare_attn(q, k, v, softmax_scale, config, do_calculation = False, log_prefix=log_prefix)
+    a_exact, a_block, max_spectral_error_ratio = compare_attn(
+        q, k, v, softmax_scale, config, do_calculation=True, log_prefix=log_prefix
+    )
     return q, k, v, max_spectral_error_ratio
 
 
@@ -248,32 +363,48 @@ def test_with_real_data(config, path):
 @pytest.mark.parametrize(
     ["batch_size", "head_size", "seq_len", "dim", "causal"], TEST_CASES
 )
-def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq_len, dim, causal):
-    seed = 42 #1234
-    mode = 'fwd'
+def test_spectral_error(
+    config: HyperAttentionConfig, batch_size, head_size, seq_len, dim, causal
+):
+    seed = 42  # 1234
+    mode = "fwd"
     # ord_list = [2, 1, float('inf')]
-    ord_list = ['fro']
+    ord_list = ["fro"]
 
     # set seed
     torch.manual_seed(seed)
 
     if config.input_dim != dim:
-        print(f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim")
+        print(
+            f"Warning: config.input_dim({config.input_dim}) != dim({dim}), reassigning config.input_dim to dim"
+        )
         config.input_dim = dim
 
     co_size = min(config.block_size, 4)
-    q, k, v = get_tensors(batch_size=batch_size, head_size=head_size, seq_len=seq_len, dim=dim, block_size=co_size, noise_scale=0.01, permute=True)
+    q, k, v = get_tensors(
+        batch_size=batch_size,
+        head_size=head_size,
+        seq_len=seq_len,
+        dim=dim,
+        block_size=co_size,
+        noise_scale=0.01,
+        permute=True,
+    )
     print(f"q[0, 0, 0, :] = \n{q[0, 0, 0, :]}")
     print(f"k[0, 0, 0, :] = \n{k[0, 0, 0, :]}")
     print(f"v[0, 0, 0, :] = \n{v[0, 0, 0, :]}")
 
     with torch.no_grad():
         softmax_scale = dim ** (-0.5)
-        exact_attn, exact_lse = exact_attention_xformers(q, k, v, softmax_scale, causal=causal)
+        exact_attn, exact_lse = exact_attention_xformers(
+            q, k, v, softmax_scale, causal=causal
+        )
         exact_attn_f32 = exact_attn.to(torch.float32)
         exact_lse_f32 = exact_lse.to(torch.float32)
 
-        exact_attn2, exact_lse2 = exact_attention_cuda(q, k, v, softmax_scale, causal=causal)
+        exact_attn2, exact_lse2 = exact_attention_cuda(
+            q, k, v, softmax_scale, causal=causal
+        )
         # exact_attn, exact_lse = exact_attention(q, k, v, softmax_scale, causal=causal)
         exact_attn2_f32 = exact_attn2.to(torch.float32)
         exact_lse2_f32 = exact_lse2.to(torch.float32)
@@ -283,7 +414,8 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
             block_size=config.block_size,
             sample_size=config.sample_size,
             min_seq_len=config.min_seq_len,
-            impl="cuda").to(device='cuda', dtype=q.dtype)
+            impl="cuda",
+        ).to(device="cuda", dtype=q.dtype)
 
         attn_hyper = HyperAttention(
             input_dim=dim,  # config.input_dim == dim
@@ -291,7 +423,8 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
             sample_size=config.sample_size,
             min_seq_len=config.min_seq_len,
             approximate_unsampled=config.approximate_unsampled,
-            impl=config.impl).to(device='cuda', dtype=q.dtype)
+            impl=config.impl,
+        ).to(device="cuda", dtype=q.dtype)
 
         rst_attn0, rst_lse0 = attn_hyper0(q, k, v, causal=causal, return_lse=True)
         rst_attn0_f32 = rst_attn0.to(torch.float32)
@@ -317,24 +450,48 @@ def test_spectral_error(config: HyperAttentionConfig, batch_size, head_size, seq
         print(f"rst_lse0[0, 0, :10, :] = \n{torch.squeeze(rst_lse0[0, 0, :10, :])}")
         print(f"rst_lse[0, 0, :10, :] = \n{torch.squeeze(rst_lse[0, 0, :10, :])}")
         print(f"exact_lse[0, 0, :10, :] = \n{torch.squeeze(exact_lse[0, 0, :10, :])}")
-        print(f"diff_lse_f32[0, 0, :10, :] = \n{torch.squeeze(diff_lse_f32[0, 0, :10, :])}")
+        print(
+            f"diff_lse_f32[0, 0, :10, :] = \n{torch.squeeze(diff_lse_f32[0, 0, :10, :])}"
+        )
 
-        print(f"torch.norm reference: {torch.norm(exact_attn - rst_attn0, p='fro') / torch.norm(exact_attn, p='fro')}")
+        print(
+            f"torch.norm reference: {torch.norm(exact_attn - rst_attn0, p='fro') / torch.norm(exact_attn, p='fro')}"
+        )
         for ord_ in ord_list:
             log_prefix = f"[{config.impl:<8}], seq_len: {seq_len:<8}, causal: {causal}, ord: {ord_}, "
-            compute_error_ratio(diff_attn_f32, diff_lse_f32, exact_attn_f32, exact_lse_f32, ord=ord_, log_prefix=log_prefix + "new ")
-            compute_error_ratio(diff_attn0_f32, diff_lse0_f32, exact_attn_f32, exact_lse_f32, ord=ord_, log_prefix=log_prefix + "old ")
+            compute_error_ratio(
+                diff_attn_f32,
+                diff_lse_f32,
+                exact_attn_f32,
+                exact_lse_f32,
+                ord=ord_,
+                log_prefix=log_prefix + "new ",
+            )
+            compute_error_ratio(
+                diff_attn0_f32,
+                diff_lse0_f32,
+                exact_attn_f32,
+                exact_lse_f32,
+                ord=ord_,
+                log_prefix=log_prefix + "old ",
+            )
 
 
-def compute_error_ratio(diff_attn, diff_lse, exact_attn, exact_lse, ord='fro', log_prefix=""):
-    diff_attn_norm = torch.linalg.matrix_norm(diff_attn, ord=ord)  # By default: dim = (-2, -1)
+def compute_error_ratio(
+    diff_attn, diff_lse, exact_attn, exact_lse, ord="fro", log_prefix=""
+):
+    diff_attn_norm = torch.linalg.matrix_norm(
+        diff_attn, ord=ord
+    )  # By default: dim = (-2, -1)
     exact_attn_norm = torch.linalg.matrix_norm(exact_attn, ord=ord)
     spectral_error_ratio = diff_attn_norm / exact_attn_norm
     max_spectral_error_ratio = spectral_error_ratio.max().item()
 
-    lse_error_ratio = diff_lse/torch.abs(exact_lse)
+    lse_error_ratio = diff_lse / torch.abs(exact_lse)
     max_lse_error_ratio = lse_error_ratio.max().item()
-    print(f"{log_prefix}max_spectral_error_ratio: {max_spectral_error_ratio:.5f}, max_lse_error_ratio: {max_lse_error_ratio:.5f} | ")
+    print(
+        f"{log_prefix}max_spectral_error_ratio: {max_spectral_error_ratio:.5f}, max_lse_error_ratio: {max_lse_error_ratio:.5f} | "
+    )
     return max_spectral_error_ratio, max_lse_error_ratio
 
 
