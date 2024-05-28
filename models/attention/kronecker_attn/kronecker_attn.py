@@ -2,9 +2,6 @@ import random
 
 import einops
 import torch
-from attention.hyper_attn.utils import (
-    add_scaled_self_attentions,
-)
 
 
 class KroneckerAttention(torch.nn.Module):
@@ -83,9 +80,16 @@ class KroneckerAttention(torch.nn.Module):
         # concatenate the v_gps along the last dimension
         v_gp = torch.cat(v_gps, dim=-1)
 
-        attn_gp, lse_gp = self.attn_calculator(
-            q_gp, k_gp, v_gp, scale, causal=False, return_lse=True
+        # attn_gps shape = [batch_size, head_size, n_gp[0], dim * n_key_groups]
+        # lsp_gp shape = [batch_size, head_size, n_gp[0], 1]
+        attn_rst = self.attn_calculator(
+            q_gp, k_gp, v_gp, scale, causal=False, return_lse=return_lse
         )
+
+        if not return_lse:
+            attn_gp = attn_rst
+        else:
+            attn_gp, lse_gp = attn_rst
 
         # 2. Estimate the scaling factor matrix: S = C_{m x 1} * S'_{m x n}
         # where C_{m x 1} is the scaling factors for one picked key group.
@@ -102,30 +106,20 @@ class KroneckerAttention(torch.nn.Module):
         s_gps = norm_gps / norm_gps[..., c_gp[0], c_gp[1]]
 
         # 3. Compute the kronecker product of S and B
-        # attn_gps is a list of n_key_groups items
-        attn_gps = attn_gp.chunk(n_key_groups, dim=-1)
-        attn_set = []
-        lse_set = []
-        for i in range(n_query_groups):
-            # attn_: [batch_size, head_size, n_gp[0], dim]
-            attn_ = attn_gps[0]
-            # lse_: [batch_size, head_size, n_gp[0], 1]
-            lse_ = lse_gp
-            s_ = s_gps[..., i, 0]
-            # TODO: use reduction.
-            for j in range(1, n_key_groups):
-                attn_, lse_, s_ = add_scaled_self_attentions(
-                    attn_,
-                    lse_,
-                    s_,
-                    attn_gps[j],
-                    lse_gp,
-                    s_gps[..., i, j],
-                )
+        # attn_gps shape = [batch_size, head_size, 1, n_gp[0], n_key_groups, dim]
+        attn_gps = torch.stack(attn_gp.chunk(n_key_groups, dim=-1), dim=-2).unsqueeze_(
+            2
+        )
+        # s_gps shape = [batch_size, head_size, n_query_groups, 1, n_key_groups]
+        s_gps = s_gps.unsqueeze_(3)
+        s_gps_sum = torch.sum(s_gps, dim=-1, keepdim=True)
 
-            attn_set.append(attn_)
-            lse_set.append(lse_)
-
-        attn = torch.cat(attn_set, dim=-2)
-        lse = torch.cat(lse_set, dim=-2)
-        return attn, lse
+        # attn shape = [batch_size, head_size, n_query_groups, n_gp[0], dim]
+        attn = torch.matmul(attn_gps, s_gps) / s_gps_sum
+        attn = attn.reshape(batch_size, head_size, n_query, -1)
+        if not return_lse:
+            return attn
+        else:
+            # lsp_gp shape = [batch_size, head_size, n_gp[0], 1]
+            lse = lse_gp.unsqueeze_(2) + torch.log(s_gps_sum.squeeze_(-1))
+            return attn, lse
