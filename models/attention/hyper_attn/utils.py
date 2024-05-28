@@ -75,12 +75,11 @@ def add_scaled_self_attentions(attn1, lse1, s1, attn2, lse2, s2):
     output:
         - same as add_self_attentions(attn1, lse1+log(s1), attn2, lse2+log(s2))
     """
-    log_s1 = torch.log(s1)
-    log_s2 = torch.log(s2)
-    c = (1 / (1 + (lse2 + log_s2 - lse1 - log_s1).exp())).to(dtype=attn1.dtype)
+    log_s = torch.log(s2 / s1)
+    c = (1 / (1 + (lse2 + log_s - lse1).exp())).to(dtype=attn1.dtype)
     attn = c * attn1 + (1 - c) * attn2
-    lse = lse1 + log_s1 - (c + torch.finfo(lse1.dtype).eps).log()
-    return attn, lse, 1
+    lse = lse1 - (c + torch.finfo(lse1.dtype).eps).log()
+    return attn, lse, s1
 
 
 def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
