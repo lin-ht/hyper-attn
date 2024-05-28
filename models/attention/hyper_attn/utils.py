@@ -1,12 +1,17 @@
 import math
+
 import torch
+
 try:
     from flash_attn import flash_attn_func as flash_attn_func_cuda
 except ImportError:
     flash_attn_func_cuda = None
 
 from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
-from attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
+from attention.flash_attn2.flash_attn_xformers import (
+    flash_attn_func as flash_attn_func_xformers,
+)
+
 
 def indexing(x, indices, chunk_size=-1):
     """
@@ -32,8 +37,12 @@ def indexing(x, indices, chunk_size=-1):
         x = x.gather(2, indices.unsqueeze(-1).expand(-1, -1, -1, x.shape[-1]))
         new_n = math.ceil(x.shape[2] / chunk_size) * chunk_size
         if new_n <= 0 or new_n - x.shape[2] <= 0:
-            import pdb; pdb.set_trace();
-        return torch.nn.functional.pad(x, (0,0,0,new_n-x.shape[2]), mode='constant',value=0.)
+            import pdb
+
+            pdb.set_trace()
+        return torch.nn.functional.pad(
+            x, (0, 0, 0, new_n - x.shape[2]), mode="constant", value=0.0
+        )
 
 
 def add_self_attentions(attn1, lse1, attn2, lse2):
@@ -52,9 +61,26 @@ def add_self_attentions(attn1, lse1, attn2, lse2):
         = lse1 + log(1 + exp(lse2 - lse1)) = lse1 - log(c)
     """
     c = (1 / (1 + (lse2 - lse1).exp())).to(dtype=attn1.dtype)
-    attn = c * attn1 + (1-c) * attn2
+    attn = c * attn1 + (1 - c) * attn2
     lse = lse1 - (c + torch.finfo(lse1.dtype).eps).log()
     return attn, lse
+
+
+def add_scaled_self_attentions(attn1, lse1, s1, attn2, lse2, s2):
+    """
+    inputs:
+        - attn1, attn2: 4d-tensors with shape [b, h, n, d]
+        - lse1, lse2: 4d-tensors of log-sum-exp with shape [b, h, n, 1]
+        - s1, s2: 4d-tensors of relative scales (>0) with shape [b, h, n, 1]
+    output:
+        - same as add_self_attentions(attn1, lse1+log(s1), attn2, lse2+log(s2))
+    """
+    log_s1 = torch.log(s1)
+    log_s2 = torch.log(s2)
+    c = (1 / (1 + (lse2 + log_s2 - lse1 - log_s1).exp())).to(dtype=attn1.dtype)
+    attn = c * attn1 + (1 - c) * attn2
+    lse = lse1 + log_s1 - (c + torch.finfo(lse1.dtype).eps).log()
+    return attn, lse, 1
 
 
 def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
@@ -62,10 +88,17 @@ def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
     # input   key.shape = [batch_size, head_size, n_key,   dim]
     if query.dtype not in [torch.bfloat16, torch.float16]:
         # qk.shape = [batch_size, head_size, n_query, n_key]
-        qk = query @ key.transpose(-1,-2) * softmax_scale
+        qk = query @ key.transpose(-1, -2) * softmax_scale
         if causal:
             # wipe out the uper triangular part of qk by adding -inf
-            qk += (torch.ones(query.shape[2], key.shape[2], device=query.device) * torch.finfo(query.dtype).min).triu(1).reshape(1,1,query.shape[2], key.shape[2])
+            qk += (
+                (
+                    torch.ones(query.shape[2], key.shape[2], device=query.device)
+                    * torch.finfo(query.dtype).min
+                )
+                .triu(1)
+                .reshape(1, 1, query.shape[2], key.shape[2])
+            )
         # out.shape = [batch_size, head_size, n_query, dim]
         out = qk.softmax(dim=-1) @ value
         # lse.shape = [batch_size, head_size, n_query, 1]
@@ -73,26 +106,39 @@ def exact_attention(query, key, value, softmax_scale, causal=False, bias=None):
         return out, lse
 
     out, lse = flash_attn_func(
-        query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
-        bias, causal, softmax_scale)
-    out = out.transpose(1,2)
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        bias,
+        causal,
+        softmax_scale,
+    )
+    out = out.transpose(1, 2)
 
     lse = lse.detach()
     if lse.shape[2] != out.shape[2]:
-        lse = lse[:,:,:out.shape[2]]
+        lse = lse[:, :, : out.shape[2]]
     lse = lse.unsqueeze(-1)
     return out, lse
 
 
 def exact_attention_cuda(query, key, value, softmax_scale, causal=False, bias=None):
     if flash_attn_func_cuda is None:
-        raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
+        raise ImportError(
+            "Please install flash_attn (pip install flash-attn --no-build-isolation)"
+        )
     out, lse, _ = flash_attn_func_cuda(
-        query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
-        softmax_scale=softmax_scale, causal=causal, return_attn_probs=True)
-    out = out.transpose(1,2)
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_attn_probs=True,
+    )
+    out = out.transpose(1, 2)
     lse = lse.unsqueeze(-1)
     return out, lse
+
 
 def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bias=None):
     # HyperAttn input format: BHMK
@@ -103,9 +149,14 @@ def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bia
     # H = heads per group
     # K = embedding size per head
     out, lse = flash_attn_func_xformers(
-        query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
-        bias, causal, softmax_scale)
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        bias,
+        causal,
+        softmax_scale,
+    )
 
-    out = out.transpose(1,2)
+    out = out.transpose(1, 2)
     lse = lse.unsqueeze(-1)
     return out, lse
