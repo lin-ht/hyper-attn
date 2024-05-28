@@ -2,7 +2,7 @@ import math
 import torch
 from einops import rearrange
 
-from .utils import exact_attention, exact_attention_cuda, add_self_attentions, indexing
+from .utils import exact_attention_xformers, exact_attention_cuda, add_self_attentions, indexing
 from .angular_lsh import AngularLSH
 
 
@@ -38,7 +38,7 @@ class HyperAttention(torch.nn.Module):
                 if self.cuda:
                     attn, lse = exact_attention_cuda(query, key, value, scale, causal=True)
                 else:
-                    attn, lse = exact_attention(query, key, value, scale, causal=True)
+                    attn, lse = exact_attention_xformers(query, key, value, scale, causal=True)
             else:
 
                 # If n_query is odd we pad inputs by adding all-zero rows
@@ -95,7 +95,7 @@ class HyperAttention(torch.nn.Module):
             if self.cuda:
                 return exact_attention_cuda(query, key, value, scale, causal=False)
             else:
-                return exact_attention(query, key, value, scale, causal=False)
+                return exact_attention_xformers(query, key, value, scale, causal=False)
 
         # 1. Sorted block-diagonal via sortLSH
         _, query_sort_idx = torch.sort(self.lsh.hash(query), dim=2, stable=True) # batch_size x head_size x n
@@ -124,7 +124,7 @@ class HyperAttention(torch.nn.Module):
                     query_split_per_block, key_split_per_block, value_split_per_block,
                     softmax_scale=scale, causal=False)
             else:
-                attn_block, lse_block = exact_attention(
+                attn_block, lse_block = exact_attention_xformers(
                     query_split_per_block, key_split_per_block, value_split_per_block,
                     softmax_scale=scale, causal=False)
 
@@ -169,7 +169,7 @@ class HyperAttention(torch.nn.Module):
                 block_mask = block_mask.to(query_sorted.dtype)
                 block_mask *= torch.finfo(query_sorted.dtype).min # adding -inf added to QK^T
 
-                attn_res, lse_res = exact_attention(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
+                attn_res, lse_res = exact_attention_xformers(query_sorted, key_subset, value_subset, scale, causal=False, bias=block_mask)
             else:
                 attn_res, lse_res = exact_attention_cuda(query_sorted, key_subset, value_subset, scale, causal=False)
             lse_res = lse_res + math.log(weights)
