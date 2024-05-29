@@ -51,11 +51,11 @@ class KroneckerAttention(torch.nn.Module):
         """
         Return the approximated attention result A*V and log-sum-exp lse.
         by approximating the attention matrix A through kronecker product:
-        A_{pm x qn} = S_{m x n} ⊗ B_{p x q}
-            [s_00*B, s_01*B, ..., s_0n*B]
-        =   [s_10*B, s_11*B, ..., s_1n*B]
-            [  ...,    ...,  ...,   ... ]
-            [s_m0*B, s_m1*B, ..., s_mn*B]
+        A_{pm x qn} = softmax(S_{m x n} ⊗ B_{p x q})
+                    [s_00*B, s_01*B, ..., s_0n*B]
+        = softmax(  [s_10*B, s_11*B, ..., s_1n*B] )
+                    [  ...,    ...,  ...,   ... ]
+                    [s_m0*B, s_m1*B, ..., s_mn*B]
         where m = n_query_groups, n = n_key_groups, p = n_query/m, q = n_key/n.
         """
 
@@ -108,7 +108,7 @@ class KroneckerAttention(torch.nn.Module):
         # 2. Estimate the scaling factor matrix: S = C_{m x 1} * S'_{m x n}
         # where C_{m x 1} is the scaling factors for one picked key group.
         k_picked = random.randint(0, n_gp[1] - 1)
-        k_sample = key[:, k_picked :: n_gp[1], :, :]
+        k_sample = key[:, :, k_picked :: n_gp[1], :]
 
         q_ = query.reshape([-1, n_query, dim])
         # k_ = einops.rearrange(k_sample, "b h l d -> (b h) d l")
@@ -120,17 +120,36 @@ class KroneckerAttention(torch.nn.Module):
         # s_gps shape = [batch_size, head_size, n_query_groups, n_key_groups]
         s_gps = norm_gps / norm_gps[..., c_gp[0], c_gp[1]].unsqueeze_(-1).unsqueeze_(-1)
 
-        # 3. Compute the kronecker product of S and B
+        # 3. Approximate Softmax(S⊗B)V that involved kronecker product
+        # Approximate softmax(sB)V from known softmax(B)V
+        # Taylor series expansion: exp(x) = 1 + x + x^2/2! + x^3/3! + ...
+        # SUM_j exp(b_j)*v_j = SUM_j (1 + b_j + b_j^2/2! + b_j^3/3! + ...) * v_j
+        # SUM_j exp(s*b_j)*v_j = SUM_j (1 + s*b_j + s^2*b_j^2/2 + s^3*b_j^3/6 + ...) * v_j
+        # = (1 - s) SUM_j{v_j} +  SUM_j{s*(1 + b_j + s*b_j^2/2 + s^2*b_j^3/6 + ...) * v_j}
+        # (if b_j is small and s is around 1.0, the higher order terms are negligible)
+        # ~ (1 - s) SUM_j{v_j} +  SUM_j{s*(1 + b_j + s*b_j^2/2) * v_j}
+        # = (1 - s) SUM_j{v_j} +  s * SUM_j{ (1 + b_j + b_j^2/2) * v_j} + s(s-1) * SUM_j{b_j^2/2 * v_j}
+        # ~ (1 - s) SUM_j{v_j} + s * SUM_j{exp(b_j) * v_j} + s(s-1)/2 * SUM_j{b_j^2 * v_j}
+        # ~ (1 - s) SUM_j{v_j} + s * SUM_j{exp(b_j) * v_j}
+        # = (1 - s) SUM_j{v_j} + s * exp(lse) * (attn)
+        # = SUM_j{v_j} + s * (SUM_j{exp(b_j) * v_j} - SUM_j{v_j})
+        # The last one means the approximation result is a linear interpolation.
+        # SUM_j{exp(s*b_j)}
+        # ~ (1 - s) SUM_j{1} + s * SUM_j{exp(b_j)} + s(s-1)/2 * SUM_j{b_j^2}
+        # ~ (1 - s) SUM_j{1} + s * SUM_j{exp(b_j)}
+        # = (1 - s) SUM_j{1} + s * (exp(lse))
+        # Therefore, we can approximate the softmax(sB)V by
+        # (1 - s) SUM_j{v_j} + s * exp(lse) * (attn) / (1 - s) SUM_j{1} + s * (exp(lse))
+
         # attn_gps shape = [batch_size, head_size, 1, n_gp[0], n_key_groups, dim]
-        attn_gps = torch.stack(attn_gp.chunk(n_key_groups, dim=-1), dim=-2).unsqueeze_(
-            2
-        )
+        attn_gps = torch.stack(attn_gp.chunk(n_key_groups, dim=-1), dim=-2)
+        attn_gps = attn_gps.unsqueeze_(2)
         # s_gps shape = [batch_size, head_size, n_query_groups, 1, n_key_groups]
         s_gps = s_gps.unsqueeze_(3)
         s_gps_sum = torch.sum(s_gps, dim=-1, keepdim=True)
 
         # attn shape = [batch_size, head_size, n_query_groups, n_gp[0], dim]
-        attn = torch.matmul(attn_gps, s_gps) / s_gps_sum
+        attn = torch.matmul(s_gps.unsqueeze_(-2), attn_gps) / s_gps_sum.unsqueeze_(-1)
         attn = attn.reshape(batch_size, head_size, n_query, -1)
         if not return_lse:
             return attn
