@@ -120,7 +120,7 @@ class KroneckerAttention(torch.nn.Module):
         # s_gps shape = [batch_size, head_size, n_query_groups, n_key_groups]
         s_gps = norm_gps / norm_gps[..., c_gp[0], c_gp[1]].unsqueeze_(-1).unsqueeze_(-1)
 
-        # 3. Approximate Softmax(S⊗B)V that involved kronecker product
+        # 3. Approximate Softmax(S⊗B)V that involves kronecker product
         # Approximate softmax(sB)V from known softmax(B)V
         # Taylor series expansion: exp(x) = 1 + x + x^2/2! + x^3/3! + ...
         # SUM_j exp(b_j)*v_j = SUM_j (1 + b_j + b_j^2/2! + b_j^3/3! + ...) * v_j
@@ -139,17 +139,26 @@ class KroneckerAttention(torch.nn.Module):
         # ~ (1 - s) SUM_j{1} + s * SUM_j{exp(b_j)}
         # = (1 - s) SUM_j{1} + s * (exp(lse))
         # Therefore, we can approximate the softmax(sB)V by
-        # (1 - s) SUM_j{v_j} + s * exp(lse) * (attn) / (1 - s) SUM_j{1} + s * (exp(lse))
+        # {(1 - s) SUM_j{v_j} + s * exp(lse) * (attn)} / {(1 - s) SUM_j{1} + s * (exp(lse))}
 
+        # 3.1 Compute approximation part 1: (1 - s) SUM_j{v_j}
+
+        # 3.2 Compute approximation part 2: s * exp(lse) * (attn)
         # attn_gps shape = [batch_size, head_size, 1, n_gp[0], n_key_groups, dim]
-        attn_gps = torch.stack(attn_gp.chunk(n_key_groups, dim=-1), dim=-2)
+        lse_gp_exp = lse_gp.exp()
+        attn_gps = torch.stack(
+            (lse_gp_exp * attn_gp).chunk(n_key_groups, dim=-1), dim=-2
+        )
         attn_gps = attn_gps.unsqueeze_(2)
-        # s_gps shape = [batch_size, head_size, n_query_groups, 1, n_key_groups]
-        s_gps = s_gps.unsqueeze_(3)
+        s_gps = s_gps.unsqueeze_(3).unsqueeze_(-2)
+        num_part2 = torch.matmul(s_gps, attn_gps)
+        den_part2 = torch.matmul(s_gps, lse_gp_exp.unsqueeze_(-1))
+
+        # Now s_gps shape = [batch_size, head_size, n_query_groups, 1, 1, n_key_groups]
         s_gps_sum = torch.sum(s_gps, dim=-1, keepdim=True)
 
         # attn shape = [batch_size, head_size, n_query_groups, n_gp[0], dim]
-        attn = torch.matmul(s_gps.unsqueeze_(-2), attn_gps) / s_gps_sum.unsqueeze_(-1)
+        attn = torch.matmul(s_gps, attn_gps) / s_gps_sum
         attn = attn.reshape(batch_size, head_size, n_query, -1)
         if not return_lse:
             return attn
