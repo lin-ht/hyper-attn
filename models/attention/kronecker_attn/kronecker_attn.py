@@ -120,7 +120,7 @@ class KroneckerAttention(torch.nn.Module):
         # s_gps shape = [batch_size, head_size, n_query_groups, n_key_groups]
         s_gps = norm_gps / norm_gps[..., c_gp[0], c_gp[1]].unsqueeze_(-1).unsqueeze_(-1)
 
-        # 3. Approximate Softmax(S⊗B)V that involves kronecker product
+        # 3. Approximate each entry Softmax(s_ij⊗B)V_k of the kronecker product
         # Approximate softmax(sB)V from known softmax(B)V
         # Taylor series expansion: exp(x) = 1 + x + x^2/2! + x^3/3! + ...
         # SUM_j exp(b_j)*v_j = SUM_j (1 + b_j + b_j^2/2! + b_j^3/3! + ...) * v_j
@@ -142,29 +142,53 @@ class KroneckerAttention(torch.nn.Module):
         # {(1 - s) SUM_j{v_j} + s * exp(lse) * (attn)} / {(1 - s) SUM_j{1} + s * (exp(lse))}
 
         # 3.1 Compute approximation part 1: (1 - s) SUM_j{v_j}
+        # Make v_gps shape = [batch_size, head_size, n_key_groups, n_gp[1], dim]
+        v_gps = value.reshape(batch_size, head_size, n_key_groups, -1, dim)
+        # Make v_gps shape = [batch_size, head_size, 1, n_key_groups, dim]
+        v_gps = v_gps.sum(dim=-2, keepdim=False).unsqueeze_(2)
+
+        # s_gps shape = [batch_size, head_size, n_query_groups, n_key_groups, 1]
+        one_minus_s_gps = 1 - s_gps.unsqueeze_(-1)
+        # num_part1 shape = [batch_size, head_size, n_query_groups, n_key_groups, dim]
+        num_part1 = one_minus_s_gps * v_gps
+        den_part1 = one_minus_s_gps * n_gp[1]
+        num_part1.unsqueeze_(-2)
+        den_part1.unsqueeze_(-2)
 
         # 3.2 Compute approximation part 2: s * exp(lse) * (attn)
-        # attn_gps shape = [batch_size, head_size, 1, n_gp[0], n_key_groups, dim]
+
+        # lsp_gp shape = [batch_size, head_size, n_gp[0], 1]
         lse_gp_exp = lse_gp.exp()
+        # attn_gps shape = [batch_size, head_size, n_gp[0], n_key_groups, dim]
         attn_gps = torch.stack(
             (lse_gp_exp * attn_gp).chunk(n_key_groups, dim=-1), dim=-2
         )
-        attn_gps = attn_gps.unsqueeze_(2)
-        s_gps = s_gps.unsqueeze_(3).unsqueeze_(-2)
-        num_part2 = torch.matmul(s_gps, attn_gps)
-        den_part2 = torch.matmul(s_gps, lse_gp_exp.unsqueeze_(-1))
+        # attn_gps shape = [batch_size, head_size, 1, n_key_groups, n_gp[0], dim]
+        attn_gps = attn_gps.transpose_(-2, -3).unsqueeze_(2)
+        # Make s_gps shape = [batch_size, head_size, n_query_groups, n_key_groups, 1, 1]
+        s_gps.unsqueeze_(-1)
+        # Make lsp_gp shape = [batch_size, head_size, 1, 1, n_gp[0], 1]
+        lse_gp_exp.unsqueeze_(2).unsqueeze_(2)
+        # num_part2 shape = [batch_size, head_size, n_query_groups, n_key_groups, n_gp[0], dim]
+        num_part2 = s_gps * attn_gps
+        den_part2 = s_gps * lse_gp_exp
 
-        # Now s_gps shape = [batch_size, head_size, n_query_groups, 1, 1, n_key_groups]
-        s_gps_sum = torch.sum(s_gps, dim=-1, keepdim=True)
+        # 3.3 include more terms for higher order approximation if needed
+        # ...
 
-        # attn shape = [batch_size, head_size, n_query_groups, n_gp[0], dim]
-        attn = torch.matmul(s_gps, attn_gps) / s_gps_sum
-        attn = attn.reshape(batch_size, head_size, n_query, -1)
+        # num_arr shape = [batch_size, head_size, n_query_groups, n_key_groups, n_gp[0], dim]
+        num_arr = num_part1 + num_part2
+        den_arr = den_part1 + den_part2
+
+        # 4. merge all the entries into the final attn result
+        num_agg = num_arr.sum(dim=-3)
+        den_agg = den_arr.sum(dim=-3)
+        attn = (num_agg / den_agg).reshape(batch_size, head_size, n_query, dim)
+
         if not return_lse:
             return attn
         else:
-            # lsp_gp shape = [batch_size, head_size, n_gp[0], 1]
-            lse = lse_gp.unsqueeze_(2) + torch.log(s_gps_sum.squeeze_(-1))
+            lse = den_agg.log().reshape(batch_size, head_size, n_query, 1)
             return attn, lse
 
 
