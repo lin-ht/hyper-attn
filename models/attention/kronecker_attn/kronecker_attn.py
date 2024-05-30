@@ -214,7 +214,7 @@ def compute_error_ratio(
 
     lse_std_mean = torch.std_mean(lse_error_ratio.reshape(-1), dim=-1)
     print(
-        f"{log_prefix} Lse mean relative err: "
+        f"{log_prefix} Lse  mean relative err: "
         f"{lse_std_mean[1].item()*100:.02}%, "
         f"relative err std: {lse_std_mean[0].item()*100:.02}% | "
     )
@@ -222,14 +222,19 @@ def compute_error_ratio(
     return attn_std_mean, lse_std_mean
 
 
-def random_test(std_scale=0.3):
+def random_test(
+    n_query_groups=3,
+    n_query_group_size=5,
+    n_key_groups=2,
+    n_key_group_size=4,
+    std_scale=0.3,
+    threshold=0.1,
+):
     batch_size = 2
     head_size = 4
-    n_query = 8
-    n_key = 8
     dim = 16
-    n_query_groups = 2
-    n_key_groups = 2
+    n_query = n_query_group_size * n_query_groups
+    n_key = n_key_group_size * n_key_groups
 
     n_gp = [n_query // n_query_groups, n_key // n_key_groups]
     c_gp = [n_query_groups // 2, n_key_groups // 2]
@@ -309,12 +314,10 @@ def random_test(std_scale=0.3):
         attn_approx, lse_approx, attn_exact, lse_exact, ord="fro"
     )
 
-    # torch.testing.assert_allclose(attn_approx, attn_exact, rtol=1e-2, atol=1e-2)
-    # torch.testing.assert_allclose(lse_approx, lse_exact, rtol=1e-2, atol=1e-2)
-    assert torch.all(relative_attn_err_std_mean[0] < 0.1)
-    assert torch.all(relative_attn_err_std_mean[1] < 0.1)
-    assert torch.all(relative_lse_err_std_mean[0] < 0.1)
-    assert torch.all(relative_lse_err_std_mean[1] < 0.1)
+    assert torch.all(relative_attn_err_std_mean[0] < threshold)
+    assert torch.all(relative_attn_err_std_mean[1] < threshold)
+    assert torch.all(relative_lse_err_std_mean[0] < threshold)
+    assert torch.all(relative_lse_err_std_mean[1] < threshold)
 
 
 if __name__ == "__main__":
