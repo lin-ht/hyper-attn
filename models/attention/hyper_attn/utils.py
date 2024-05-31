@@ -147,15 +147,25 @@ def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bia
     # G = heads groups (in case of multiquery/grouped query attention)
     # H = heads per group
     # K = embedding size per head
-    out, lse = flash_attn_func_xformers(
-        query.transpose(1, 2),
-        key.transpose(1, 2),
-        value.transpose(1, 2),
-        bias,
-        causal,
-        softmax_scale,
-    )
+    shape_size = len(query.shape)
+    if shape_size > 3:
+        q_ = query.transpose(1, -2)
+        k_ = key.transpose(1, -2)
+        v_ = value.transpose(1, -2)
+    else:
+        q_ = query.unsqueeze(1)
+        k_ = key.unsqueeze(1)
+        v_ = value.unsqueeze(1)
 
-    out = out.transpose(1, 2)
-    lse = lse.unsqueeze(-1)
+    out, lse = flash_attn_func_xformers(q_, k_, v_, bias, causal, softmax_scale)
+
+    if shape_size > 3:
+        out = out.transpose(1, -2)
+        lse = lse.unsqueeze(-1)
+    else:
+        out = out.squeeze(1)
+        lse = lse.squeeze(1).unsqueeze(-1)
+
+    seq_len = query.shape[-2]
+    lse = lse[..., :seq_len, :]
     return out, lse

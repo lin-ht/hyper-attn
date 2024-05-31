@@ -149,7 +149,7 @@ class KroneckerAttention(torch.nn.Module):
         v_gps = v_gps.sum(dim=-2, keepdim=False).unsqueeze_(2)
 
         # s_gps shape = [batch_size, head_size, n_query_groups, n_key_groups, 1]
-        one_minus_s_gps = 1 - s_gps.unsqueeze_(-1)
+        one_minus_s_gps = torch.clamp(1 - s_gps.unsqueeze_(-1), min=0.0)
         # num_part1 shape = [batch_size, head_size, n_query_groups, n_key_groups, dim]
         num_part1 = one_minus_s_gps * v_gps
         den_part1 = one_minus_s_gps * n_gp[1]
@@ -193,6 +193,14 @@ class KroneckerAttention(torch.nn.Module):
             return attn, lse
 
 
+def attn_calculator_func(query, key, value, scale, causal=False, return_lse=False):
+    attn, lse = exact_attention(query, key, value, scale, causal)
+    if return_lse:
+        return attn, lse
+    else:
+        return attn
+
+
 def compute_error_ratio(
     attn_approx, lse_approx, exact_attn, exact_lse, ord="fro", log_prefix=""
 ):
@@ -208,27 +216,26 @@ def compute_error_ratio(
     attn_std_mean = torch.std_mean(spectral_error_ratio.reshape(-1), dim=-1)
     print(
         f"{log_prefix} Attn mean relative err: "
-        f"{attn_std_mean[1].item()*100:.02}%, "
-        f"relative err std: {attn_std_mean[0].item()*100:.02}% | "
+        f"{attn_std_mean[1].item()*100:.02f}%, "
+        f"relative err std: {attn_std_mean[0].item()*100:.02f}% | "
     )
 
     lse_std_mean = torch.std_mean(lse_error_ratio.reshape(-1), dim=-1)
     print(
         f"{log_prefix} Lse  mean relative err: "
-        f"{lse_std_mean[1].item()*100:.02}%, "
-        f"relative err std: {lse_std_mean[0].item()*100:.02}% | "
+        f"{lse_std_mean[1].item()*100:.02f}%, "
+        f"relative err std: {lse_std_mean[0].item()*100:.02f}% | "
     )
 
     return attn_std_mean, lse_std_mean
 
 
-def random_test(
+def load_random_qkv(
     n_query_groups=3,
     n_query_group_size=5,
     n_key_groups=2,
     n_key_group_size=4,
     std_scale=0.3,
-    threshold=0.1,
 ):
     batch_size = 2
     head_size = 4
@@ -286,13 +293,37 @@ def random_test(
         batch_size, head_size, n_key, dim, dtype=torch.bfloat16, device="cuda"
     )
 
-    def attn_calculator_func(query, key, value, scale, causal=False, return_lse=False):
-        attn, lse = exact_attention(query, key, value, scale, causal)
-        if return_lse:
-            return attn, lse
-        else:
-            return attn
+    return query, key, value, n_query_groups, n_key_groups
 
+
+def load_real_qkv(path_prefix, n_query_groups, n_key_groups):
+    query = torch.permute(torch.load(path_prefix + "q.pt"), (0, 2, 1, 3))
+    key = torch.permute(torch.load(path_prefix + "k.pt"), (0, 2, 1, 3))
+    value = torch.permute(torch.load(path_prefix + "v.pt"), (0, 2, 1, 3))
+    return query, key, value, n_query_groups, n_key_groups
+
+
+def create_uniform_kronecker_qkv(path_prefix, n_query_groups, n_key_groups):
+    query = torch.permute(torch.load(path_prefix + "q.pt"), (0, 2, 1, 3))
+    key = torch.permute(torch.load(path_prefix + "k.pt"), (0, 2, 1, 3))
+    value = torch.permute(torch.load(path_prefix + "v.pt"), (0, 2, 1, 3))
+
+    b, h, n_query, dim = query.shape
+    n_key = key.shape[2]
+
+    n_gp = [n_query // n_query_groups, n_key // n_key_groups]
+    c_gp = [n_query_groups // 2, n_key_groups // 2]
+    q_gp = query[..., c_gp[0] * n_gp[0] : c_gp[0] * n_gp[0] + n_gp[0], :]
+    k_gp = key[..., c_gp[1] * n_gp[1] : c_gp[1] * n_gp[1] + n_gp[1], :]
+
+    query = torch.stack([q_gp] * n_query_groups, dim=2).reshape(b, h, -1, dim)
+    key = torch.stack([k_gp] * n_key_groups, dim=2).reshape(b, h, -1, dim)
+
+    return query, key, value, n_query_groups, n_key_groups
+
+
+def test_kronecker_attn(query, key, value, n_query_groups, n_key_groups, threshold=0.1):
+    batch_size, head_size, n_query, dim = query.shape
     attn_module = KroneckerAttention(attn_calculator_func)
 
     scale = dim ** (-0.5)
@@ -320,6 +351,16 @@ def random_test(
     assert torch.all(relative_lse_err_std_mean[1] < threshold)
 
 
+QKV_LIST = [
+    "tests/data/set_2/layer37_self_attn_it307_20240521162722916847_",
+    "tests/data/set_3/layer04_self_attn_it999_20240521162129306018_",
+]
+
+
 if __name__ == "__main__":
-    random_test()
+    qkv_id = 0
+    # load_random_qkv()
+    data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
+    # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6)
+    test_kronecker_attn(*data, threshold=0.5)
     print("All tests passed!")
