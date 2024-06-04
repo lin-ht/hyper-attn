@@ -34,7 +34,17 @@ class KroneckerDecompAttention(torch.nn.Module):
         self.sampling_ratio = sampling_ratio
 
     @staticmethod
-    def estimateKroneckerDecomps(query, key, value, n_query_groups, n_key_groups):
+    def estimateKroneckerDecomps(
+        query,
+        key,
+        value,
+        n_query_groups,
+        n_key_groups,
+        config={
+            "mode": "median",
+            "significant_channels": 3,
+        },
+    ):
         batch_size, head_size, n_query, dim = query.shape
         # n_key = key.shape[2]
         # n_gp = [n_query // n_query_groups, n_key // n_key_groups]
@@ -42,8 +52,46 @@ class KroneckerDecompAttention(torch.nn.Module):
         query_gps = query.reshape(batch_size, head_size, n_query_groups, -1, dim)
         key_gps = key.reshape(batch_size, head_size, n_key_groups, -1, dim)
 
-        query_rep = query_gps.mean(dim=2, keepdim=True)
-        key_rep = key_gps.mean(dim=2, keepdim=True)
+        if config["mode"] == "median":
+            sig_chns = config["significant_channels"]
+            sig_weights = torch.tensor(
+                [10**i for i in range(sig_chns, 1, -1)],
+                dtype=query.dtype,
+                device=query.device,
+            )
+            sig_weights = sig_weights.reshape(sig_chns, 1)
+
+            query_sig = query_gps.mean(dim=2, keepdim=True)
+            key_sig = key_gps.mean(dim=2, keepdim=True)
+
+            query_topk = torch.topk(query_sig, sig_chns, dim=-1)
+            query_topk_indices = (query_topk.indices).expand(*query_gps.shape[:-1], -1)
+            query_topk_indices_1d = nd_to_1d_index(
+                query_topk_indices, query_gps.shape + (1,)
+            )
+
+            query_sig = query_gps.view(-1, 1)[query_topk_indices_1d].reshape(
+                -1, sig_chns
+            )
+            # query_val shape: [batch_size, head_size, n_query_gp, n_query_groups]
+            query_val = (
+                torch.matmul(query_sig, sig_weights).squeeze_(-1).transpose_(-2, -1)
+            )
+            query_median_indices = torch.median(query_val, dim=-1).indices
+
+            # query_gps shape: [batch_size, head_size, n_query_gp, n_query_groups, dim]
+            query_gps.transpose_(-3, -2)
+            query_median_indices_1d = nd_to_1d_index(
+                query_median_indices, query_gps.shape[:-1]
+            )
+
+            query_rep = query_gps.view(-1, dim)[query_median_indices_1d]
+            query_rep.reshape_(batch_size, head_size, 1, -1, dim)
+
+            key_topk = torch.topk(key_sig, config["significant_channels"], dim=-1)
+        else:
+            query_rep = query_gps.mean(dim=2, keepdim=True)
+            key_rep = key_gps.mean(dim=2, keepdim=True)
 
         query_residual = query_gps - query_rep
         key_residual = key_gps - key_rep
