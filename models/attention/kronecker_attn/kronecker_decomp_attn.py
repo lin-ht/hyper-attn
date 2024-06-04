@@ -357,14 +357,14 @@ def compute_error_ratio(
 
 def load_random_qkv(
     n_query_groups=3,
-    n_query_group_size=5,
+    n_query_group_size=4,
     n_key_groups=2,
-    n_key_group_size=4,
+    n_key_group_size=5,
     sampling_ratio=0.25,
 ):
-    batch_size = 2
-    head_size = 4
-    dim = 16
+    batch_size = 1  # 2
+    head_size = 1  # 4
+    dim = 8  # 16
     n_query = n_query_group_size * n_query_groups
     n_key = n_key_group_size * n_key_groups
 
@@ -388,6 +388,7 @@ def load_random_qkv(
     q_sample_set = torch.multinomial(
         q_sample_prob, n_q_res_gp, replacement=False
     ).reshape(batch_size, head_size, n_query_groups, -1)
+    print(f"q_sample_set[0,0]({q_sample_set.shape}) = \n{q_sample_set[0,0]}")
     q_indices_1d = nd_to_1d_index(
         q_sample_set, (batch_size, head_size, n_query_groups, n_gp[0])
     )
@@ -398,6 +399,7 @@ def load_random_qkv(
     k_sample_set = torch.multinomial(
         k_sample_prob, n_k_res_gp, replacement=False
     ).reshape(batch_size, head_size, n_key_groups, -1)
+    print(f"k_sample_set[0,0] ({k_sample_set.shape}) = \n{k_sample_set[0,0]}")
     k_indices_1d = nd_to_1d_index(
         k_sample_set, (batch_size, head_size, n_key_groups, n_gp[1])
     )
@@ -421,9 +423,11 @@ def load_random_qkv(
 
     query = query.reshape(batch_size, head_size, n_query, dim)
     key = key.reshape(batch_size, head_size, n_key, dim)
+    print(f"q_rep_gp[0,0,0] ({q_rep_gp.shape}) = \n{q_rep_gp[0,0,0]}")
+    print(f"query[0,0] ({query.shape}) = \n{query[0,0]}")
 
-    print(f"query[0,0] = {query[0,0]}")
-    print(f"key[0,0] = {key[0,0]}")
+    print(f"k_rep_gp[0,0,0] ({k_rep_gp.shape}) = \n{k_rep_gp[0,0,0]}")
+    print(f"key[0,0] ({key.shape})= \n{key[0,0]}")
     value = torch.randn(
         batch_size, head_size, n_key, dim, dtype=key.dtype, device=key.device
     )
@@ -469,7 +473,7 @@ def create_uniform_kronecker_qkv(
         .reshape(b, h, 1, -1)
         .expand(-1, -1, n_query_groups, -1)
     )
-    print(f"created q_sample_set[0,0,0] = {q_sample_set[0,0,0]}")
+    print(f"created q_sample_set[0,0,0] = \n{q_sample_set[0,0,0]}")
 
     k_sample_prob = torch.ones(1, device=key.device).as_strided_(
         (b, h, 1, n_gp[1]), (0, 0, 0, 0)
@@ -479,7 +483,7 @@ def create_uniform_kronecker_qkv(
         .reshape(b, h, 1, -1)
         .expand(-1, -1, n_key_groups, -1)
     )
-    print(f"created k_sample_set[0,0,0] = {k_sample_set[0,0,0]}")
+    print(f"created k_sample_set[0,0,0] = \n{k_sample_set[0,0,0]}")
 
     query_ = torch.stack([q_gp] * n_query_groups, dim=2)
     key_ = torch.stack([k_gp] * n_key_groups, dim=2)
@@ -509,11 +513,11 @@ def test_kronecker_attn(
 
     torch.set_printoptions(sci_mode=False)
 
-    print(f"attn_approx[0,0] = {attn_approx[0,0]}")
-    print(f"lse_approx[0,0] = {lse_approx[0,0]}")
+    print(f"attn_approx[0,0] = \n{attn_approx[0,0]}")
+    print(f"lse_approx[0,0] = \n{lse_approx[0,0]}")
     attn_exact, lse_exact = attn_calculator_func(query, key, value, scale, False, True)
-    print(f"attn_exact[0,0] = {attn_exact[0,0]}")
-    print(f"lse_exact[0,0] = {lse_exact[0,0]}")
+    print(f"attn_exact[0,0] = \n{attn_exact[0,0]}")
+    print(f"lse_exact[0,0] = \n{lse_exact[0,0]}")
 
     torch.set_printoptions(profile="default")
 
