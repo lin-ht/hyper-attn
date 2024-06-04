@@ -133,8 +133,9 @@ class KroneckerDecompAttention(torch.nn.Module):
             m = min(m, max_sample)  # clamp the sample size
 
         # Random sample according to the norm of the input tensor
-        sample_prob = val.norm(p=2, dim=-1).reshape(-1, n) + torch.finfo(val.dtype).eps
-
+        sample_prob = (
+            val.norm(p=2, dim=-1).reshape(-1, n) * 100 + torch.finfo(val.dtype).eps
+        )
         sample_set = torch.multinomial(sample_prob, m, replacement=False)
         return sample_set.reshape(val.shape[:-2] + (m,))
 
