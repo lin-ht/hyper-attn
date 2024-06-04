@@ -134,6 +134,7 @@ class KroneckerDecompAttention(torch.nn.Module):
 
         # Random sample according to the norm of the input tensor
         sample_prob = val.norm(p=2, dim=-1).reshape(-1, n) + torch.finfo(val.dtype).eps
+
         sample_set = torch.multinomial(sample_prob, m, replacement=False)
         return sample_set.reshape(val.shape[:-2] + (m,))
 
@@ -305,7 +306,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         q_sub_ind_1d = nd_to_1d_index(q_sub_ind, q_res.shape[:-1])
         attn_view = attn.view(-1, dim)
 
-        attn_view[q_sub_ind_1d] = attn_p2_new.view(-1, dim)
+        attn_view[q_sub_ind_1d] = attn_p2_new.reshape(-1, dim)
         attn = attn.reshape(batch_size, head_size, n_query, dim)
 
         if not return_lse:
@@ -313,7 +314,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         else:
             lse = torch.cat([lse_p1] * n_query_groups, dim=2)
             lse_view = lse.view(-1, 1)
-            lse_view[q_sub_ind_1d] = lse_p2_new.view(-1, 1)
+            lse_view[q_sub_ind_1d] = lse_p2_new.reshape(-1, 1)
             lse = lse.reshape(batch_size, head_size, n_query, 1)
             return attn, lse
 
@@ -362,9 +363,9 @@ def load_random_qkv(
     n_key_group_size=5,
     sampling_ratio=0.25,
 ):
-    batch_size = 1  # 2
-    head_size = 1  # 4
-    dim = 8  # 16
+    batch_size = 2
+    head_size = 4
+    dim = 16
     n_query = n_query_group_size * n_query_groups
     n_key = n_key_group_size * n_key_groups
 
@@ -466,17 +467,19 @@ def create_uniform_kronecker_qkv(
 
     # Hack to have same probability for each key column
     q_sample_prob = torch.ones(1, device=query.device).as_strided_(
-        (b, h, 1, n_gp[0]), (0, 0, 0, 0)
+        (b * h * 1, n_gp[0]), (0, 0)
     )
     q_sample_set = (
         torch.multinomial(q_sample_prob, n_q_res_gp, replacement=False)
         .reshape(b, h, 1, -1)
         .expand(-1, -1, n_query_groups, -1)
     )
+
     print(f"created q_sample_set[0,0,0] = \n{q_sample_set[0,0,0]}")
+    q_indices_1d = nd_to_1d_index(q_sample_set, (b, h, n_query_groups, n_gp[0]))
 
     k_sample_prob = torch.ones(1, device=key.device).as_strided_(
-        (b, h, 1, n_gp[1]), (0, 0, 0, 0)
+        (b * h * 1, n_gp[1]), (0, 0)
     )
     k_sample_set = (
         torch.multinomial(k_sample_prob, n_k_res_gp, replacement=False)
@@ -484,14 +487,21 @@ def create_uniform_kronecker_qkv(
         .expand(-1, -1, n_key_groups, -1)
     )
     print(f"created k_sample_set[0,0,0] = \n{k_sample_set[0,0,0]}")
+    k_indices_1d = nd_to_1d_index(k_sample_set, (b, h, n_key_groups, n_gp[1]))
 
-    query_ = torch.stack([q_gp] * n_query_groups, dim=2)
-    key_ = torch.stack([k_gp] * n_key_groups, dim=2)
+    query_ = torch.stack([q_gp] * n_query_groups, dim=2).reshape(-1, dim)
+    key_ = torch.stack([k_gp] * n_key_groups, dim=2).reshape(-1, dim)
 
-    query_[q_sample_set] = query.reshape(b, h, n_query_groups, -1, dim)[q_sample_set]
-    key_[q_sample_set] = key.reshape(b, h, n_key_groups, -1, dim)[k_sample_set]
+    query_[q_indices_1d] = query.reshape(-1, dim)[q_indices_1d]
+    key_[k_indices_1d] = key.reshape(-1, dim)[k_indices_1d]
 
-    return query, key, value, n_query_groups, n_key_groups
+    return (
+        query_.reshape(query.shape),
+        key_.reshape(key.shape),
+        value,
+        n_query_groups,
+        n_key_groups,
+    )
 
 
 def test_kronecker_attn(
@@ -540,11 +550,11 @@ if __name__ == "__main__":
     # Set the seed
     torch.manual_seed(9)
 
-    qkv_id = 1
-    data = load_random_qkv()
-    test_kronecker_attn(*data, sampling_ratio=0.5, threshold=0.5)
+    # data = load_random_qkv()
+    # test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.1)
 
+    qkv_id = 1
     # data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
-    # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6)
-    # test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.5)
+    data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6, sampling_ratio=1 / 5)
+    test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.5)
     print("All tests passed!")
