@@ -216,15 +216,15 @@ def compute_error_ratio(
     attn_std_mean = torch.std_mean(spectral_error_ratio.reshape(-1), dim=-1)
     print(
         f"{log_prefix} Attn mean relative err: "
-        f"{attn_std_mean[1].item()*100:.02f}%, "
-        f"relative err std: {attn_std_mean[0].item()*100:.02f}% | "
+        f"{attn_std_mean[1].item()*100:4.02f}%, "
+        f"relative err std: {attn_std_mean[0].item()*100:4.02f}% | "
     )
 
     lse_std_mean = torch.std_mean(lse_error_ratio.reshape(-1), dim=-1)
     print(
         f"{log_prefix} Lse  mean relative err: "
-        f"{lse_std_mean[1].item()*100:.02f}%, "
-        f"relative err std: {lse_std_mean[0].item()*100:.02f}% | "
+        f"{lse_std_mean[1].item()*100:4.02f}%, "
+        f"relative err std: {lse_std_mean[0].item()*100:4.02f}% | "
     )
 
     return attn_std_mean, lse_std_mean
@@ -357,8 +357,65 @@ QKV_LIST = [
 ]
 
 
+import math
+
+import numpy as np
+
+
+def chebyshev_approximation_3(x, coefficients):
+    """Approximate a function using a 3-degree Chebyshev polynomial."""
+    T = [np.ones_like(x), x, 4 * x**3 - 3 * x]  # T[0] = 1, T[1] = x, T[2] = 4x^3 - 3x
+    return sum(coeff * T_i for coeff, T_i in zip(coefficients, T))
+
+
+def chebyshev_approximation_5(x, coefficients):
+    """Approximate a function using a 5-degree Chebyshev polynomial."""
+    T = [
+        np.ones_like(x),
+        x,
+        4 * x**3 - 3 * x,
+        0,
+        16 * x**5 - 20 * x**3 + 5 * x,
+    ]  # T[0] = 1, T[1] = x, T[2] = 4x^3 - 3x, T[3] = 0, T[4] = 16x^5 - 20x^3 + 5x
+    return sum(coeff * T_i for coeff, T_i in zip(coefficients, T))
+
+
+def chebyshev_approximation(x, coefficients):
+    """Approximate a function using a Chebyshev polynomial."""
+    T = [np.ones_like(x), x]  # T[0] = 1, T[1] = x
+    for i in range(2, len(coefficients)):
+        T.append(2 * x * T[-1] - T[-2])  # Recurrence relation
+    return sum(coeff * T_i for coeff, T_i in zip(coefficients, T))
+
+
+def taylor_expansion(x, degree):
+    """Compute the Taylor series expansion of exp(x) up to a given degree."""
+    return sum((x**n) / math.factorial(n) for n in range(degree + 1))
+
+
+def test_chebyshev_approximation():
+    """Test the Chebyshev approximation."""
+    # Coefficients for the Chebyshev approximation
+    # coefficients_3 = [1, 1, 0.5]  # Adjust these coefficients as needed
+    coefficients_5 = [1, 1, 0.5, 1 / 6, 1 / 24]  # Adjust these coefficients as needed
+
+    # Test the approximation
+    x = np.linspace(-1, 1, 30)
+    y_true = np.exp(x)
+    y_approx = chebyshev_approximation_5(x, coefficients_5)
+    y_approx_rec = chebyshev_approximation(x, coefficients_5)
+    y_approx_taylor = taylor_expansion(x, 5)
+
+    print("True values:", y_true)
+    print("Approximation_taylor:", y_approx_taylor)
+    print("Approximation:", y_approx)
+    print("Approximation_rec:", y_approx_rec)
+
+
 if __name__ == "__main__":
-    qkv_id = 0
+    # test_chebyshev_approximation()
+
+    qkv_id = 1
     # load_random_qkv()
     data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
     # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6)
