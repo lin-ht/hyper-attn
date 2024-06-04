@@ -202,7 +202,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         # w_rep shape = [batch_size, head_size, 1, n_query_gp, n_key_gp]
         w_rep = KroneckerDecompAttention.computeCorrMatrix(q_rep, k_rep)
         # lse_rep shape = [batch_size, head_size, 1, n_query_gp, 1]
-        attn_rep, lse_rep = KroneckerDecompAttention.matrixSoftmax(w_rep, scale)
+        soft_w_rep, lse_rep = KroneckerDecompAttention.matrixSoftmax(w_rep, scale)
 
         # split value tensor into n_key_groups along the 2nd last dimension
         v_gps = value.chunk(n_key_groups, dim=-2)
@@ -213,12 +213,12 @@ class KroneckerDecompAttention(torch.nn.Module):
         v_gps_cat.unsqueeze_(2)
 
         # Step 0: Compute the decomposable Kronecker product component P0
-        # Make num_p0 shape = [batch_size, head_size, 1, n_query_gp, n_key_groups*dim]
+        # Make attn_p0 shape = [batch_size, head_size, 1, n_query_gp, n_key_groups*dim]
         attn_p0 = torch.bmm(
-            attn_rep.reshape(-1, *attn_rep.shape[-2:]),
+            soft_w_rep.reshape(-1, *soft_w_rep.shape[-2:]),
             v_gps_cat.reshape(-1, *v_gps_cat.shape[-2:]),
         )
-        # Make num_p0 shape = [batch_size, head_size, 1, n_query_gp, dim]
+        # Make attn_p0 shape = [batch_size, head_size, 1, n_query_gp, dim]
         attn_p0 = attn_p0.reshape(batch_size, head_size, 1, -1, n_key_groups, dim).mean(
             dim=-2, keepdim=False
         )
@@ -247,7 +247,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         ).view(batch_size, head_size, -1, dim)
 
         # q_rep shape: [batch_size, head_size, 1, n_query_gp, dim]
-        # num_p1_del shape: [batch_size, head_size, n_query_gp, dim]
+        # attn_p1_del shape: [batch_size, head_size, n_query_gp, dim]
         q_rep_ = q_rep.view(batch_size, head_size, -1, dim)
         attn_p1_del, lse_p1_del = self.attn_calculator(
             q_rep_,
@@ -257,7 +257,7 @@ class KroneckerDecompAttention(torch.nn.Module):
             causal=False,
             return_lse=return_lse,
         )
-        # num_p1_del shape: [batch_size, head_size, 1, n_query_gp, dim]
+        # attn_p1_del shape: [batch_size, head_size, 1, n_query_gp, dim]
         # den_p1_del shape: [batch_size, head_size, 1, n_query_gp, 1]
         attn_p1_del.unsqueeze_(2)
         lse_p1_del.unsqueeze_(2)
@@ -405,7 +405,7 @@ def load_random_qkv(
     query = torch.cat([q_rep_gp] * n_query_groups, dim=2).reshape(-1, dim)
     key = torch.cat([k_rep_gp] * n_key_groups, dim=2).reshape(-1, dim)
 
-    res_scale = 0.0
+    res_scale = 0.01
     query[q_indices_1d] += res_scale * torch.randn(
         batch_size * head_size * n_query_groups * n_q_res_gp,
         dim,
