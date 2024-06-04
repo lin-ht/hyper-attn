@@ -42,7 +42,6 @@ class KroneckerDecompAttention(torch.nn.Module):
         n_key_groups,
         config={
             "mode": "mean",
-            "significant_channels": 3,
         },
     ):
         batch_size, head_size, n_query, dim = query.shape
@@ -53,6 +52,9 @@ class KroneckerDecompAttention(torch.nn.Module):
         key_gps = key.reshape(batch_size, head_size, n_key_groups, -1, dim)
 
         if config["mode"] == "median":
+            default_extra_config = {"significant_channels": 3}
+            config.update(default_extra_config)
+
             sig_chns = config["significant_channels"]
             sig_weights = torch.tensor(
                 [10 ** (i - 1) for i in range(sig_chns, 0, -1)],
