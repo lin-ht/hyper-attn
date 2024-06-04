@@ -188,5 +188,5 @@ def exact_attention_xformers(query, key, value, softmax_scale, causal=False, bia
         lse = lse.squeeze(1).unsqueeze(-1)
 
     seq_len = query.shape[-2]
-    lse = lse[..., :seq_len, :]
+    lse = lse[..., :seq_len, :].to(out.dtype)
     return out, lse

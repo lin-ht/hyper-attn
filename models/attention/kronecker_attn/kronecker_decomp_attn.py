@@ -1,6 +1,20 @@
+import math
+
 import torch
 from attention.hyper_attn import utils
 from attention.hyper_attn.utils import exact_attention_xformers as exact_attention
+
+
+def nd_to_1d_index(indices, shape):
+    # Convert indices to tensor
+    indices = torch.tensor(indices)
+    # Compute strides
+    count = torch.prod(torch.tensor(shape[:-1], device=indices.device)).item()
+    indices_1d = torch.arange(count, device=indices.device).unsqueeze_(dim=-1) * shape[
+        -1
+    ] + indices.reshape(count, -1)
+
+    return indices_1d.reshape(-1)
 
 
 class KroneckerDecompAttention(torch.nn.Module):
@@ -66,9 +80,9 @@ class KroneckerDecompAttention(torch.nn.Module):
             m = min(m, max_sample)  # clamp the sample size
 
         # Random sample according to the norm of the input tensor
-        sample_prob = val.norm(p=2, dim=-1) + torch.finfo(val.dtype).eps
+        sample_prob = val.norm(p=2, dim=-1).reshape(-1, n) + torch.finfo(val.dtype).eps
         sample_set = torch.multinomial(sample_prob, m, replacement=False)
-        return sample_set
+        return sample_set.reshape(val.shape[:-2] + (m,))
 
     def forward(
         self,
@@ -137,15 +151,16 @@ class KroneckerDecompAttention(torch.nn.Module):
 
         # Step 0: Compute the decomposable Kronecker product component P0
         # Make num_p0 shape = [batch_size, head_size, 1, n_query_gp, n_key_groups*dim]
-        num_p0 = torch.bmm(attn_rep, v_gps_cat)
+        attn_p0 = torch.bmm(
+            attn_rep.reshape(-1, *attn_rep.shape[-2:]),
+            v_gps_cat.reshape(-1, *v_gps_cat.shape[-2:]),
+        )
         # Make num_p0 shape = [batch_size, head_size, 1, n_query_gp, dim]
-        num_p0 = num_p0.reshape(batch_size, head_size, 1, -1, dim, n_key_groups).sum(
+        attn_p0 = attn_p0.reshape(batch_size, head_size, 1, -1, dim, n_key_groups).mean(
             dim=-1, keepdim=False
         )
         # den_p0 shape = [batch_size, head_size, 1, n_query_gp, 1]
-        den_p0 = lse_rep.exp() * n_key_groups
-        attn_p0 = num_p0 / den_p0
-        lse_p0 = den_p0.log()
+        lse_p0 = lse_rep + math.log(n_key_groups)
 
         # Step 1: Column sampling
         # Step 1.0: Key residule guided column sampling
@@ -156,10 +171,13 @@ class KroneckerDecompAttention(torch.nn.Module):
         k_sub_ind = k_sub_ind_gps.view(batch_size * head_size, n_key_groups, -1)
 
         k_rep_sub = utils.indexing(
-            k_rep.view(batch_size * head_size, n_key_groups, -1), k_sub_ind
+            torch.stack(
+                [k_rep.view(batch_size * head_size, -1, dim)] * n_key_groups, dim=1
+            ),
+            k_sub_ind,
         ).view(batch_size, head_size, -1, dim)
         k_sub = utils.indexing(
-            key.view(batch_size * head_size, n_key_groups, -1), k_sub_ind
+            key.view(batch_size * head_size, n_key_groups, -1, dim), k_sub_ind
         ).view(batch_size, head_size, -1, dim)
         v_sub = utils.indexing(
             value.view(batch_size * head_size, n_key_groups, -1, dim), k_sub_ind
@@ -209,7 +227,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         )
         q_sub_ind = q_sub_ind_gps.view(batch_size * head_size, n_query_groups, -1)
         q_sub = utils.indexing(
-            query.view(batch_size * head_size, n_query_groups, -1), q_sub_ind
+            query.view(batch_size * head_size, n_query_groups, -1, dim), q_sub_ind
         ).view(batch_size, head_size, -1, dim)
         attn_p2_new, lse_p2_new = self.attn_calculator(
             q_sub,
@@ -220,16 +238,20 @@ class KroneckerDecompAttention(torch.nn.Module):
             return_lse=return_lse,
         )
 
-        attn = torch.stack([attn_p1] * n_query_groups, dim=2)
-        attn_view = attn.view(batch_size * head_size, n_query_groups, -1, dim)
-        attn_view[q_sub_ind] = attn_p2_new
+        attn = torch.cat([attn_p1] * n_query_groups, dim=2)
+        q_sub_ind_1d = nd_to_1d_index(q_sub_ind, q_res.shape[:-1])
+        attn_view = attn.view(-1, dim)
+
+        attn_view[q_sub_ind_1d] = attn_p2_new.view(-1, dim)
+        attn = attn.reshape(batch_size, head_size, n_query, dim)
 
         if not return_lse:
             return attn
         else:
-            lse = torch.stack([lse_p1] * n_query_groups, dim=2)
-            lse_view = lse.view(batch_size * head_size, n_query_groups, -1, 1)
-            lse_view[q_sub_ind] = lse_p2_new
+            lse = torch.cat([lse_p1] * n_query_groups, dim=2)
+            lse_view = lse.view(-1, 1)
+            lse_view[q_sub_ind_1d] = lse_p2_new.view(-1, 1)
+            lse = lse.reshape(batch_size, head_size, n_query, 1)
             return attn, lse
 
 
@@ -298,40 +320,36 @@ def load_random_qkv(
 
     # Hack to have same probability for each key column
     q_sample_prob = torch.ones(1, device=q_rep_gp.device).as_strided_(
-        (batch_size, head_size, n_query_groups, n_gp[0]), (0, 0, 0, 0)
+        (batch_size * head_size * n_query_groups, n_gp[0]), (0, 0)
     )
     q_sample_set = torch.multinomial(
         q_sample_prob, n_q_res_gp, replacement=False
     ).reshape(batch_size, head_size, n_query_groups, -1)
+    q_indices_1d = nd_to_1d_index(
+        q_sample_set, (batch_size, head_size, n_query_groups, n_gp[0])
+    )
 
     k_sample_prob = torch.ones(1, device=k_rep_gp.device).as_strided_(
-        (batch_size, head_size, n_key_groups, n_gp[1]), (0, 0, 0, 0)
+        (batch_size * head_size * n_key_groups, n_gp[1]), (0, 0)
     )
     k_sample_set = torch.multinomial(
         k_sample_prob, n_k_res_gp, replacement=False
     ).reshape(batch_size, head_size, n_key_groups, -1)
-
-    query = torch.stack([q_rep_gp] * n_query_groups, dim=2).reshape(
-        batch_size, head_size, n_query_groups, -1, dim
-    )
-    key = torch.stack([k_rep_gp] * n_key_groups, dim=2).reshape(
-        batch_size, head_size, n_key_groups, -1, dim
+    k_indices_1d = nd_to_1d_index(
+        k_sample_set, (batch_size, head_size, n_key_groups, n_gp[1])
     )
 
-    query[q_sample_set] = torch.randn(
-        batch_size,
-        head_size,
-        n_query_groups,
-        n_q_res_gp,
+    query = torch.cat([q_rep_gp] * n_query_groups, dim=2).reshape(-1, dim)
+    key = torch.cat([k_rep_gp] * n_key_groups, dim=2).reshape(-1, dim)
+
+    query[q_indices_1d] += 0.01 * torch.randn(
+        batch_size * head_size * n_query_groups * n_q_res_gp,
         dim,
         dtype=query.dtype,
         device=query.device,
     )
-    key[k_sample_set] = torch.randn(
-        batch_size,
-        head_size,
-        n_key_groups,
-        n_k_res_gp,
+    key[k_indices_1d] += 0.01 * torch.randn(
+        batch_size * head_size * n_key_groups * n_k_res_gp,
         dim,
         dtype=key.dtype,
         device=key.device,
@@ -399,8 +417,8 @@ def create_uniform_kronecker_qkv(
     )
     print(f"created k_sample_set[0,0,0] = {k_sample_set[0,0,0]}")
 
-    query_ = torch.stack([q_gp.unsqueeze(2)] * n_query_groups, dim=2)
-    key_ = torch.stack([k_gp.unsqueeze(2)] * n_key_groups, dim=2)
+    query_ = torch.stack([q_gp] * n_query_groups, dim=2)
+    key_ = torch.stack([k_gp] * n_key_groups, dim=2)
 
     query_[q_sample_set] = query.reshape(b, h, n_query_groups, -1, dim)[q_sample_set]
     key_[q_sample_set] = key.reshape(b, h, n_key_groups, -1, dim)[k_sample_set]
@@ -453,7 +471,7 @@ QKV_LIST = [
 if __name__ == "__main__":
     qkv_id = 1
     data = load_random_qkv()
-    test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.5)
+    test_kronecker_attn(*data, sampling_ratio=0.5, threshold=0.5)
 
     # data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
     # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6)
