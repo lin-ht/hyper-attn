@@ -41,7 +41,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         n_query_groups,
         n_key_groups,
         config={
-            "mode": "median",
+            "mode": "mean",
             "significant_channels": 3,
         },
     ):
@@ -555,7 +555,7 @@ if __name__ == "__main__":
     # test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.1)
 
     qkv_id = 1
-    # data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
-    data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6, sampling_ratio=1 / 5)
+    data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
+    # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6, sampling_ratio=1 / 5)
     test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.5)
     print("All tests passed!")
