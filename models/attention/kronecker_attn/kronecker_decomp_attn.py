@@ -186,6 +186,16 @@ class KroneckerDecompAttention(torch.nn.Module):
                 query, key, value, scale, causal=False, return_lse=return_lse
             )
 
+        # Groudtruth for debug:
+        # attn_t, lse_t = self.attn_calculator(
+        #     query,
+        #     key,
+        #     value,
+        #     scale,
+        #     causal=False,
+        #     return_lse=return_lse,
+        # )
+
         q_rep, q_res, k_rep, k_res = KroneckerDecompAttention.estimateKroneckerDecomps(
             query, key, value, n_query_groups, n_key_groups
         )
@@ -209,8 +219,8 @@ class KroneckerDecompAttention(torch.nn.Module):
             v_gps_cat.reshape(-1, *v_gps_cat.shape[-2:]),
         )
         # Make num_p0 shape = [batch_size, head_size, 1, n_query_gp, dim]
-        attn_p0 = attn_p0.reshape(batch_size, head_size, 1, -1, dim, n_key_groups).mean(
-            dim=-1, keepdim=False
+        attn_p0 = attn_p0.reshape(batch_size, head_size, 1, -1, n_key_groups, dim).mean(
+            dim=-2, keepdim=False
         )
         # den_p0 shape = [batch_size, head_size, 1, n_query_gp, 1]
         lse_p0 = lse_rep + math.log(n_key_groups)
@@ -395,13 +405,14 @@ def load_random_qkv(
     query = torch.cat([q_rep_gp] * n_query_groups, dim=2).reshape(-1, dim)
     key = torch.cat([k_rep_gp] * n_key_groups, dim=2).reshape(-1, dim)
 
-    query[q_indices_1d] += 0.01 * torch.randn(
+    res_scale = 0.0
+    query[q_indices_1d] += res_scale * torch.randn(
         batch_size * head_size * n_query_groups * n_q_res_gp,
         dim,
         dtype=query.dtype,
         device=query.device,
     )
-    key[k_indices_1d] += 0.01 * torch.randn(
+    key[k_indices_1d] += res_scale * torch.randn(
         batch_size * head_size * n_key_groups * n_k_res_gp,
         dim,
         dtype=key.dtype,
@@ -522,6 +533,9 @@ QKV_LIST = [
 ]
 
 if __name__ == "__main__":
+    # Set the seed
+    torch.manual_seed(9)
+
     qkv_id = 1
     data = load_random_qkv()
     test_kronecker_attn(*data, sampling_ratio=0.5, threshold=0.5)
