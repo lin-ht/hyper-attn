@@ -7,7 +7,7 @@ from attention.hyper_attn.utils import exact_attention_xformers as exact_attenti
 
 def nd_to_1d_index(indices, shape):
     # Convert indices to tensor
-    indices = torch.tensor(indices)
+    # indices = torch.tensor(indices)
     # Compute strides
     count = torch.prod(torch.tensor(shape[:-1], device=indices.device)).item()
     indices_1d = torch.arange(count, device=indices.device).unsqueeze_(dim=-1) * shape[
@@ -55,40 +55,45 @@ class KroneckerDecompAttention(torch.nn.Module):
         if config["mode"] == "median":
             sig_chns = config["significant_channels"]
             sig_weights = torch.tensor(
-                [10**i for i in range(sig_chns, 1, -1)],
+                [10 ** (i - 1) for i in range(sig_chns, 0, -1)],
                 dtype=query.dtype,
                 device=query.device,
             )
             sig_weights = sig_weights.reshape(sig_chns, 1)
 
-            query_sig = query_gps.mean(dim=2, keepdim=True)
-            key_sig = key_gps.mean(dim=2, keepdim=True)
+            def get_median_group(input_gps, sig_chns, sig_weights):
+                b, h, g, n, dim = input_gps.shape
+                gp_mean = input_gps.mean(dim=2, keepdim=True)
+                gp_topk = torch.topk(gp_mean, sig_chns, dim=-1).indices
+                gp_topk_indices = gp_topk.expand(*input_gps.shape[:-1], -1)
+                gp_topk_indices_1d = nd_to_1d_index(gp_topk_indices, input_gps.shape)
 
-            query_topk = torch.topk(query_sig, sig_chns, dim=-1)
-            query_topk_indices = (query_topk.indices).expand(*query_gps.shape[:-1], -1)
-            query_topk_indices_1d = nd_to_1d_index(
-                query_topk_indices, query_gps.shape + (1,)
-            )
+                input_sig = input_gps.view(-1, 1)[gp_topk_indices_1d].reshape(
+                    *input_gps.shape[:-1], sig_chns
+                )
+                # input_val shape: [b, h, n, g]
+                # Note: torch.median is not implemented for bfloat16
+                input_val = (
+                    torch.matmul(input_sig, sig_weights)
+                    .squeeze_(-1)
+                    .transpose_(-2, -1)
+                    .to(torch.float32)
+                )
 
-            query_sig = query_gps.view(-1, 1)[query_topk_indices_1d].reshape(
-                -1, sig_chns
-            )
-            # query_val shape: [batch_size, head_size, n_query_gp, n_query_groups]
-            query_val = (
-                torch.matmul(query_sig, sig_weights).squeeze_(-1).transpose_(-2, -1)
-            )
-            query_median_indices = torch.median(query_val, dim=-1).indices
+                gp_median_indices = torch.median(
+                    input_val, dim=-1, keepdim=True
+                ).indices
 
-            # query_gps shape: [batch_size, head_size, n_query_gp, n_query_groups, dim]
-            query_gps.transpose_(-3, -2)
-            query_median_indices_1d = nd_to_1d_index(
-                query_median_indices, query_gps.shape[:-1]
-            )
+                # input_gps shape: [b, h, n, g, dim]
+                input_gps_t = input_gps.transpose(-3, -2)
+                gp_median_indices_1d = nd_to_1d_index(
+                    gp_median_indices, input_gps_t.shape[:-1]
+                )
+                input_rep = input_gps_t.reshape(-1, dim)[gp_median_indices_1d]
+                return input_rep.reshape(b, h, 1, -1, dim)
 
-            query_rep = query_gps.view(-1, dim)[query_median_indices_1d]
-            query_rep.reshape_(batch_size, head_size, 1, -1, dim)
-
-            key_topk = torch.topk(key_sig, config["significant_channels"], dim=-1)
+            query_rep = get_median_group(query_gps, sig_chns, sig_weights)
+            key_rep = get_median_group(key_gps, sig_chns, sig_weights)
         else:
             query_rep = query_gps.mean(dim=2, keepdim=True)
             key_rep = key_gps.mean(dim=2, keepdim=True)
