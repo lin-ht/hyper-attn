@@ -17,6 +17,16 @@ def nd_to_1d_index(indices, shape):
     return indices_1d.reshape(-1)
 
 
+def print_std_mean(data, log_prefix=""):
+    data_std_mean = torch.std_mean(data.reshape(-1), dim=-1)
+    print(
+        f"{log_prefix} mean: "
+        f"{data_std_mean[1].item()*100: 4.02f}%, "
+        f"{log_prefix} std: {data_std_mean[0].item()*100: 4.02f}% | "
+    )
+    return data_std_mean
+
+
 class KroneckerDecompAttention(torch.nn.Module):
     def __init__(
         self,
@@ -203,6 +213,12 @@ class KroneckerDecompAttention(torch.nn.Module):
         q_rep, q_res, k_rep, k_res = KroneckerDecompAttention.estimateKroneckerDecomps(
             query, key, value, n_query_groups, n_key_groups
         )
+        print_std_mean(q_rep, "q_rep")
+        print_std_mean(k_rep, "k_rep")
+
+        print_std_mean(q_res, "q_res")
+        print_std_mean(k_res, "k_res")
+
         # w_rep shape = [batch_size, head_size, 1, n_query_gp, n_key_gp]
         w_rep = KroneckerDecompAttention.computeCorrMatrix(q_rep, k_rep)
         # lse_rep shape = [batch_size, head_size, 1, n_query_gp, 1]
@@ -228,6 +244,19 @@ class KroneckerDecompAttention(torch.nn.Module):
         )
         # den_p0 shape = [batch_size, head_size, 1, n_query_gp, 1]
         lse_p0 = lse_rep + math.log(n_key_groups)
+
+        return_point = "p2"
+        if return_point == "p0":
+            attn_p0 = attn_p0.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                *query.shape[:-1], -1
+            )
+            if not return_lse:
+                return attn_p0
+            else:
+                lse_p0 = lse_p0.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                    *query.shape[:-1], -1
+                )
+                return attn_p0, lse_p0
 
         # Step 1: Column sampling
         # Step 1.0: Key residule guided column sampling
@@ -286,6 +315,18 @@ class KroneckerDecompAttention(torch.nn.Module):
             attn_p1, lse_p1, attn_p1_add, lse_p1_add
         )
 
+        if return_point == "p1":
+            attn_p1 = attn_p1.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                *query.shape[:-1], -1
+            )
+            if not return_lse:
+                return attn_p1
+            else:
+                lse_p1 = lse_p1.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                    *query.shape[:-1], -1
+                )
+                return attn_p1, lse_p1
+
         # Step 2: Row sampling
         # Step 2.0: Query residule guided row sampling
         # q_res shape: [batch_size, head_size, n_query_groups, n_query_gp, dim]
@@ -342,19 +383,10 @@ def compute_error_ratio(
 
     lse_error_ratio = torch.abs(diff_lse) / torch.abs(exact_lse)
 
-    attn_std_mean = torch.std_mean(spectral_error_ratio.reshape(-1), dim=-1)
-    print(
-        f"{log_prefix} Attn mean relative err: "
-        f"{attn_std_mean[1].item()*100: 4.02f}%, "
-        f"relative err std: {attn_std_mean[0].item()*100: 4.02f}% | "
+    attn_std_mean = print_std_mean(
+        spectral_error_ratio, f"{log_prefix} relative Attn error"
     )
-
-    lse_std_mean = torch.std_mean(lse_error_ratio.reshape(-1), dim=-1)
-    print(
-        f"{log_prefix} Lse  mean relative err: "
-        f"{lse_std_mean[1].item()*100: 4.02f}%, "
-        f"relative err std: {lse_std_mean[0].item()*100: 4.02f}% | "
-    )
+    lse_std_mean = print_std_mean(lse_error_ratio, f"{log_prefix} relative Lse  error")
 
     return attn_std_mean, lse_std_mean
 
@@ -554,19 +586,8 @@ def test_error_significance(path_prefix, noise_rates=[0.001, 0.01, 0.1]):
     scale = query.shape[-1] ** (-0.5)
     attn_org, lse_org = exact_attention(query, key, value, scale, causal=False)
 
-    query_std_mean = torch.std_mean(query.reshape(-1), dim=-1)
-    print(
-        f"query mean: "
-        f"{query_std_mean[1].item()*100: 4.02f}%, "
-        f"query std: {query_std_mean[0].item()*100: 4.02f}% | "
-    )
-
-    key_std_mean = torch.std_mean(key.reshape(-1), dim=-1)
-    print(
-        f"key mean: "
-        f"{key_std_mean[1].item()*100: 4.02f}%, "
-        f"key std: {key_std_mean[0].item()*100: 4.02f}% | "
-    )
+    print_std_mean(query, "query")
+    print_std_mean(key, "key")
 
     for r in noise_rates:
         query_noised = query + r * torch.randn_like(query)
@@ -598,9 +619,9 @@ if __name__ == "__main__":
 
     qkv_id = 0
 
-    test_error_significance(
-        QKV_LIST[qkv_id], noise_rates=[0.001, 0.01, 0.1, 0.2, 0.4, 0.5, 0.7, 0.9, 1.0]
-    )
+    # test_error_significance(
+    #     QKV_LIST[qkv_id], noise_rates=[0.001, 0.01, 0.1, 0.2, 0.4, 0.5, 0.7, 0.9, 1.0]
+    # )
 
     data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
     # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6, sampling_ratio=1 / 5)
