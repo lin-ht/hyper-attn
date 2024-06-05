@@ -32,16 +32,26 @@ class KroneckerDecompAttention(torch.nn.Module):
         self,
         attn_calculator,
         sampling_ratio=1 / 30,
+        sampling_mode="group",
+        row_replacing_mode="full",
     ):
         """
         Kronecker attention module.
         Input parameters:
             - attn_calculator: the calculator to compute attention result and log-sum-exp
             which should be called with input of (query, key, value, scale=None, causal=False, return_lse=False)
+            - sampling_ratio: the ratio of the sampled columns and rows
+            - sampling_mode: the mode of sampling columns and rows, either "group" or "global".
+                For "group", samples in each sub sequence group, while for "global", samples in entire sequence.
+            - row_replacing_mode: the mode of replacing the sampled rows, either "full" or "partial".
         """
         super().__init__()
         self.attn_calculator = attn_calculator
         self.sampling_ratio = sampling_ratio
+        # TODO: Implement the global sampling mode.
+        self.sampling_mode = sampling_mode
+        self.row_replacing_mode = row_replacing_mode
+        self.return_point = "p2"
 
     @staticmethod
     def estimateKroneckerDecomps(
@@ -213,6 +223,8 @@ class KroneckerDecompAttention(torch.nn.Module):
         q_rep, q_res, k_rep, k_res = KroneckerDecompAttention.estimateKroneckerDecomps(
             query, key, value, n_query_groups, n_key_groups
         )
+
+        # TODO: visualize the attn matrix between q_rep, q_res, k_rep, k_res
         print_std_mean(q_rep, "q_rep")
         print_std_mean(k_rep, "k_rep")
 
@@ -245,8 +257,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         # den_p0 shape = [batch_size, head_size, 1, n_query_gp, 1]
         lse_p0 = lse_rep + math.log(n_key_groups)
 
-        return_point = "p2"
-        if return_point == "p0":
+        if self.return_point == "p0":
             attn_p0 = attn_p0.expand(-1, -1, n_query_groups, -1, -1).reshape(
                 *query.shape[:-1], -1
             )
@@ -295,27 +306,34 @@ class KroneckerDecompAttention(torch.nn.Module):
         attn_p1_del.unsqueeze_(2)
         lse_p1_del.unsqueeze_(2)
 
-        attn_p1_add, lse_p1_add = self.attn_calculator(
-            q_rep_,
-            k_sub,
-            v_sub,
-            scale,
-            causal=False,
-            return_lse=return_lse,
-        )
-        attn_p1_add.unsqueeze_(2)
-        lse_p1_add.unsqueeze_(2)
-
         # Step 1.1: remove the sampled column from the P0 result
         attn_p1, lse_p1 = utils.subtract_self_attentions(
             attn_p0, lse_p0, attn_p1_del, lse_p1_del
         )
-        # Step 1.2: add the sampled column to the modified P0 result
-        attn_p1, lse_p1 = utils.add_self_attentions(
-            attn_p1, lse_p1, attn_p1_add, lse_p1_add
-        )
 
-        if return_point == "p1":
+        # Step 1.2: add the sampled column to the modified P0 result
+        if self.row_replacing_mode == "full":
+            attn_p1_add, lse_p1_add = self.attn_calculator(
+                q_rep_,
+                k_sub,
+                v_sub,
+                scale,
+                causal=False,
+                return_lse=return_lse,
+            )
+            attn_p1_add.unsqueeze_(2)
+            lse_p1_add.unsqueeze_(2)
+
+            attn_p1, lse_p1 = utils.add_self_attentions(
+                attn_p1, lse_p1, attn_p1_add, lse_p1_add
+            )
+        else:  # self.row_replacing_mode == "partial"
+            # TODO: Implement the partial row replacing mode.
+            # Don't add back those sampled columns for rows that will be replaced in step p2.
+            # Only pick the remaining rows in the attn_p1_add and lse_p1_add to add.
+            raise NotImplementedError("Partial row replacing is not implemented yet.")
+
+        if self.return_point == "p1":
             attn_p1 = attn_p1.expand(-1, -1, n_query_groups, -1, -1).reshape(
                 *query.shape[:-1], -1
             )
@@ -337,29 +355,37 @@ class KroneckerDecompAttention(torch.nn.Module):
         q_sub = utils.indexing(
             query.view(batch_size * head_size, n_query_groups, -1, dim), q_sub_ind
         ).view(batch_size, head_size, -1, dim)
-        attn_p2_new, lse_p2_new = self.attn_calculator(
-            q_sub,
-            key,
-            value,
-            scale,
-            causal=False,
-            return_lse=return_lse,
-        )
 
-        attn = torch.cat([attn_p1] * n_query_groups, dim=2)
-        q_sub_ind_1d = nd_to_1d_index(q_sub_ind, q_res.shape[:-1])
-        attn_view = attn.view(-1, dim)
+        if self.row_replacing_mode == "full":
+            attn_p2_new, lse_p2_new = self.attn_calculator(
+                q_sub,
+                key,
+                value,
+                scale,
+                causal=False,
+                return_lse=return_lse,
+            )
 
-        attn_view[q_sub_ind_1d] = attn_p2_new.reshape(-1, dim)
-        attn = attn.reshape(batch_size, head_size, n_query, dim)
+            attn = torch.cat([attn_p1] * n_query_groups, dim=2)
+            q_sub_ind_1d = nd_to_1d_index(q_sub_ind, q_res.shape[:-1])
+            attn_view = attn.view(-1, dim)
+
+            attn_view[q_sub_ind_1d] = attn_p2_new.reshape(-1, dim)
+            attn = attn.reshape(batch_size, head_size, n_query, dim)
+
+            if return_lse:
+                lse = torch.cat([lse_p1] * n_query_groups, dim=2)
+                lse_view = lse.view(-1, 1)
+                lse_view[q_sub_ind_1d] = lse_p2_new.reshape(-1, 1)
+                lse = lse.reshape(batch_size, head_size, n_query, 1)
+        # else:  # self.row_replacing_mode == "partial"
+        #     # q_rep shape: [batch_size, head_size, 1, n_query_gp, dim]
+        #     attn_p2_del = attn_p1_add.expand(-1, -1, n_query_groups, -1, -1)
+        #     lse_p2_del = lse_p1_add.expand(-1, -1, n_query_groups, -1, -1)
 
         if not return_lse:
             return attn
         else:
-            lse = torch.cat([lse_p1] * n_query_groups, dim=2)
-            lse_view = lse.view(-1, 1)
-            lse_view[q_sub_ind_1d] = lse_p2_new.reshape(-1, 1)
-            lse = lse.reshape(batch_size, head_size, n_query, 1)
             return attn, lse
 
 
@@ -666,6 +692,7 @@ def test_error_significance(path_prefix, noise_rates=[0.001, 0.01, 0.1]):
 
 
 QKV_LIST = [
+    "tests/data/set_1/layer04_self_attn_it538_20240521162520148861_",
     "tests/data/set_2/layer37_self_attn_it307_20240521162722916847_",
     "tests/data/set_3/layer04_self_attn_it999_20240521162129306018_",
 ]
@@ -677,7 +704,7 @@ if __name__ == "__main__":
     # data = load_random_qkv()
     # test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.1)
 
-    qkv_id = 1
+    qkv_id = 2
 
     # test_error_significance(
     #     QKV_LIST[qkv_id], noise_rates=[0.001, 0.01, 0.1, 0.2, 0.4, 0.5, 0.7, 0.9, 1.0]
