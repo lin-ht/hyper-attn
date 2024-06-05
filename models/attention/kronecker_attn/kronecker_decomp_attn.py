@@ -33,7 +33,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         attn_calculator,
         sampling_ratio=1 / 30,
         sampling_mode="group",
-        row_replacing_mode="full",
+        row_replacing_mode="partial",  # "full",
     ):
         """
         Kronecker attention module.
@@ -312,26 +312,20 @@ class KroneckerDecompAttention(torch.nn.Module):
         )
 
         # Step 1.2: add the sampled column to the modified P0 result
-        if self.row_replacing_mode == "full":
-            attn_p1_add, lse_p1_add = self.attn_calculator(
-                q_rep_,
-                k_sub,
-                v_sub,
-                scale,
-                causal=False,
-                return_lse=return_lse,
-            )
-            attn_p1_add.unsqueeze_(2)
-            lse_p1_add.unsqueeze_(2)
+        attn_p1_add, lse_p1_add = self.attn_calculator(
+            q_rep_,
+            k_sub,
+            v_sub,
+            scale,
+            causal=False,
+            return_lse=return_lse,
+        )
+        attn_p1_add.unsqueeze_(2)
+        lse_p1_add.unsqueeze_(2)
 
-            attn_p1, lse_p1 = utils.add_self_attentions(
-                attn_p1, lse_p1, attn_p1_add, lse_p1_add
-            )
-        else:  # self.row_replacing_mode == "partial"
-            # TODO: Implement the partial row replacing mode.
-            # Don't add back those sampled columns for rows that will be replaced in step p2.
-            # Only pick the remaining rows in the attn_p1_add and lse_p1_add to add.
-            raise NotImplementedError("Partial row replacing is not implemented yet.")
+        attn_p1, lse_p1 = utils.add_self_attentions(
+            attn_p1, lse_p1, attn_p1_add, lse_p1_add
+        )
 
         if self.return_point == "p1":
             attn_p1 = attn_p1.expand(-1, -1, n_query_groups, -1, -1).reshape(
@@ -365,28 +359,73 @@ class KroneckerDecompAttention(torch.nn.Module):
                 causal=False,
                 return_lse=return_lse,
             )
+        else:  # self.row_replacing_mode == "partial"
+            # q_rep shape: [batch_size, head_size, 1, n_query_gp, dim]
+            attn_p1_full = attn_p1.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                batch_size * head_size, n_query_groups, -1, dim
+            )
+            lse_p1_full = lse_p1.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                batch_size * head_size, n_query_groups, -1, 1
+            )
+            attn_p1_sub = utils.indexing(
+                attn_p1_full,
+                q_sub_ind,
+            ).view(batch_size, head_size, -1, dim)
 
-            attn = torch.cat([attn_p1] * n_query_groups, dim=2)
-            q_sub_ind_1d = nd_to_1d_index(q_sub_ind, q_res.shape[:-1])
-            attn_view = attn.view(-1, dim)
+            lse_p1_sub = utils.indexing(
+                lse_p1_full,
+                q_sub_ind,
+            ).view(batch_size, head_size, -1, 1)
 
-            attn_view[q_sub_ind_1d] = attn_p2_new.reshape(-1, dim)
-            attn = attn.reshape(batch_size, head_size, n_query, dim)
+            attn_p2_del_full = attn_p1_add.expand(
+                -1, -1, n_query_groups, -1, -1
+            ).reshape(batch_size * head_size, n_query_groups, -1, dim)
+            lse_p2_del_full = lse_p1_add.expand(-1, -1, n_query_groups, -1, -1).reshape(
+                batch_size * head_size, n_query_groups, -1, 1
+            )
 
-            if return_lse:
-                lse = torch.cat([lse_p1] * n_query_groups, dim=2)
-                lse_view = lse.view(-1, 1)
-                lse_view[q_sub_ind_1d] = lse_p2_new.reshape(-1, 1)
-                lse = lse.reshape(batch_size, head_size, n_query, 1)
-        # else:  # self.row_replacing_mode == "partial"
-        #     # q_rep shape: [batch_size, head_size, 1, n_query_gp, dim]
-        #     attn_p2_del = attn_p1_add.expand(-1, -1, n_query_groups, -1, -1)
-        #     lse_p2_del = lse_p1_add.expand(-1, -1, n_query_groups, -1, -1)
+            attn_p2_del = utils.indexing(
+                attn_p2_del_full,
+                q_sub_ind,
+            ).view(batch_size, head_size, -1, dim)
 
-        if not return_lse:
-            return attn
-        else:
+            lse_p2_del = utils.indexing(
+                lse_p2_del_full,
+                q_sub_ind,
+            ).view(batch_size, head_size, -1, 1)
+
+            attn_p2_new, lse_p2_new = utils.subtract_self_attentions(
+                attn_p1_sub, lse_p1_sub, attn_p2_del, lse_p2_del
+            )
+
+            attn_p2_add, lse_p2_add = self.attn_calculator(
+                q_sub,
+                k_sub,
+                v_sub,
+                scale,
+                causal=False,
+                return_lse=return_lse,
+            )
+
+            attn_p2_new, lse_p2_new = utils.add_self_attentions(
+                attn_p2_new, lse_p2_new, attn_p2_add, lse_p2_add
+            )
+
+        attn = torch.cat([attn_p1] * n_query_groups, dim=2)
+        q_sub_ind_1d = nd_to_1d_index(q_sub_ind, q_res.shape[:-1])
+        attn_view = attn.view(-1, dim)
+
+        attn_view[q_sub_ind_1d] = attn_p2_new.reshape(-1, dim)
+        attn = attn.reshape(batch_size, head_size, n_query, dim)
+
+        if return_lse:
+            lse = torch.cat([lse_p1] * n_query_groups, dim=2)
+            lse_view = lse.view(-1, 1)
+            lse_view[q_sub_ind_1d] = lse_p2_new.reshape(-1, 1)
+            lse = lse.reshape(batch_size, head_size, n_query, 1)
             return attn, lse
+        else:
+            return attn
 
 
 def attn_calculator_func(query, key, value, scale, causal=False, return_lse=False):
