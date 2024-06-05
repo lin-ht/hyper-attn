@@ -601,8 +601,68 @@ def test_error_significance(path_prefix, noise_rates=[0.001, 0.01, 0.1]):
             attn_org,
             lse_org,
             ord="fro",
-            log_prefix=f"noise rate {r:.2f} ",
+            log_prefix=f"noise rate {r:.3f} ",
         )
+    # q_noised and k_noised
+    # noise rate 0.001 relative Attn error mean:  0.03%, noise rate 0.00  relative Attn error std:  0.02% |
+    # noise rate 0.01  relative Attn error mean:  0.33%, noise rate 0.01  relative Attn error std:  0.15% |
+    # noise rate 0.10  relative Attn error mean:  3.34%, noise rate 0.10  relative Attn error std:  1.54% |
+    # noise rate 0.20  relative Attn error mean:  6.74%, noise rate 0.20  relative Attn error std:  3.08% |
+    # noise rate 0.40  relative Attn error mean:  13.73%, noise rate 0.40  relative Attn error std:  6.16% |
+    # noise rate 0.50  relative Attn error mean:  17.63%, noise rate 0.50  relative Attn error std:  7.84% |
+    # noise rate 0.70  relative Attn error mean:  26.31%, noise rate 0.70  relative Attn error std:  11.59% |
+    # noise rate 0.90  relative Attn error mean:  37.96%, noise rate 0.90  relative Attn error std:  17.38% |
+    # noise rate 1.00  relative Attn error mean:  46.09%, noise rate 1.00  relative Attn error std:  22.52% |
+
+    # noise rate 0.001 relative Lse  error mean:  0.01%, noise rate 0.00  relative Lse  error std:  0.00% |
+    # noise rate 0.01  relative Lse  error mean:  0.06%, noise rate 0.01  relative Lse  error std:  0.05% |
+    # noise rate 0.10  relative Lse  error mean:  0.59%, noise rate 0.10  relative Lse  error std:  0.46% |
+    # noise rate 0.20  relative Lse  error mean:  1.18%, noise rate 0.20  relative Lse  error std:  0.92% |
+    # noise rate 0.40  relative Lse  error mean:  2.51%, noise rate 0.40  relative Lse  error std:  1.95% |
+    # noise rate 0.50  relative Lse  error mean:  3.30%, noise rate 0.50  relative Lse  error std:  2.55% |
+    # noise rate 0.70  relative Lse  error mean:  5.38%, noise rate 0.70  relative Lse  error std:  4.08% |
+    # noise rate 0.90  relative Lse  error mean:  8.63%, noise rate 0.90  relative Lse  error std:  6.13% |
+    # noise rate 1.00  relative Lse  error mean:  11.04%, noise rate 1.00  relative Lse  error std:  7.44% |
+
+    # q_noised only:
+    # noise rate 0.001  relative Attn error mean:  0.03%, noise rate 0.001  relative Attn error std:  0.02% |
+    # noise rate 0.001  relative Lse  error mean:  0.01%, noise rate 0.001  relative Lse  error std:  0.00% |
+    # noise rate 0.010  relative Attn error mean:  0.29%, noise rate 0.010  relative Attn error std:  0.15% |
+    # noise rate 0.010  relative Lse  error mean:  0.06%, noise rate 0.010  relative Lse  error std:  0.05% |
+    # noise rate 0.100  relative Attn error mean:  2.92%, noise rate 0.100  relative Attn error std:  1.56% |
+    # noise rate 0.100  relative Lse  error mean:  0.58%, noise rate 0.100  relative Lse  error std:  0.45% |
+    # noise rate 0.200  relative Attn error mean:  5.84%, noise rate 0.200  relative Attn error std:  3.11% |
+    # noise rate 0.200  relative Lse  error mean:  1.16%, noise rate 0.200  relative Lse  error std:  0.91% |
+    # noise rate 0.400  relative Attn error mean:  11.66%, noise rate 0.400  relative Attn error std:  6.17% |
+    # noise rate 0.400  relative Lse  error mean:  2.33%, noise rate 0.400  relative Lse  error std:  1.81% |
+    # noise rate 0.500  relative Attn error mean:  14.61%, noise rate 0.500  relative Attn error std:  7.74% |
+    # noise rate 0.500  relative Lse  error mean:  2.92%, noise rate 0.500  relative Lse  error std:  2.27% |
+    # noise rate 0.700  relative Attn error mean:  20.41%, noise rate 0.700  relative Attn error std:  10.71% |
+    # noise rate 0.700  relative Lse  error mean:  4.10%, noise rate 0.700  relative Lse  error std:  3.22% |
+    # noise rate 0.900  relative Attn error mean:  26.29%, noise rate 0.900  relative Attn error std:  13.88% |
+    # noise rate 0.900  relative Lse  error mean:  5.30%, noise rate 0.900  relative Lse  error std:  4.15% |
+    # noise rate 1.000  relative Attn error mean:  29.17%, noise rate 1.000  relative Attn error std:  15.22% |
+    # noise rate 1.000  relative Lse  error mean:  5.92%, noise rate 1.000  relative Lse  error std:  4.62% |
+
+    # k_noised only:
+    # noise rate 0.001  relative Attn error mean:  0.01%, noise rate 0.001  relative Attn error std:  0.01% |
+    # noise rate 0.001  relative Lse  error mean:  0.00%, noise rate 0.001  relative Lse  error std:  0.00% |
+    # noise rate 0.010  relative Attn error mean:  0.15%, noise rate 0.010  relative Attn error std:  0.06% |
+    # noise rate 0.010  relative Lse  error mean:  0.00%, noise rate 0.010  relative Lse  error std:  0.00% |
+    # noise rate 0.100  relative Attn error mean:  1.48%, noise rate 0.100  relative Attn error std:  0.61% |
+    # noise rate 0.100  relative Lse  error mean:  0.05%, noise rate 0.100  relative Lse  error std:  0.03% |
+    # noise rate 0.200  relative Attn error mean:  3.03%, noise rate 0.200  relative Attn error std:  1.18% |
+    # noise rate 0.200  relative Lse  error mean:  0.18%, noise rate 0.200  relative Lse  error std:  0.09% |
+    # noise rate 0.400  relative Attn error mean:  6.07%, noise rate 0.400  relative Attn error std:  2.53% |
+    # noise rate 0.400  relative Lse  error mean:  0.72%, noise rate 0.400  relative Lse  error std:  0.22% |
+    # noise rate 0.500  relative Attn error mean:  7.87%, noise rate 0.500  relative Attn error std:  3.22% |
+    # noise rate 0.500  relative Lse  error mean:  1.10%, noise rate 0.500  relative Lse  error std:  0.29% |
+    # noise rate 0.700  relative Attn error mean:  11.51%, noise rate 0.700  relative Attn error std:  4.98% |
+    # noise rate 0.700  relative Lse  error mean:  2.16%, noise rate 0.700  relative Lse  error std:  0.52% |
+    # noise rate 0.900  relative Attn error mean:  15.92%, noise rate 0.900  relative Attn error std:  7.06% |
+    # noise rate 0.900  relative Lse  error mean:  3.53%, noise rate 0.900  relative Lse  error std:  0.78% |
+    # noise rate 1.000  relative Attn error mean:  18.56%, noise rate 1.000  relative Attn error std:  8.50% |
+    # noise rate 1.000  relative Lse  error mean:  4.41%, noise rate 1.000  relative Lse  error std:  0.96% |
 
 
 QKV_LIST = [
@@ -617,7 +677,7 @@ if __name__ == "__main__":
     # data = load_random_qkv()
     # test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.1)
 
-    qkv_id = 0
+    qkv_id = 1
 
     # test_error_significance(
     #     QKV_LIST[qkv_id], noise_rates=[0.001, 0.01, 0.1, 0.2, 0.4, 0.5, 0.7, 0.9, 1.0]
@@ -626,4 +686,14 @@ if __name__ == "__main__":
     data = load_real_qkv(QKV_LIST[qkv_id], 6, 6)
     # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6, sampling_ratio=1 / 5)
     test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.5)
+
+    # qkv_id = 0 Early return results:
+    # R(attn_p2) 48.93%, R(lse_p2)  1.64%
+    # R(attn_p1) 50.63%, R(lse_p1)  1.69%
+    # R(attn_p0) 52.55%, R(lse_p0)  1.70%
+    #
+    # qkv_id = 1 Early return results:
+    # R(attn_p2) 36.68%, R(lse_p2)  3.36%
+    # R(attn_p1) 37.96%, R(lse_p1)  3.48%
+    # R(attn_p0) 39.17%, R(lse_p0)  3.52%
     print("All tests passed!")
