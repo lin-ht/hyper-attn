@@ -2,22 +2,33 @@ import torch
 
 
 class AngularLSH(torch.nn.Module):
-
-    def __init__(self, num_projs, dim, rng=None):
+    def __init__(self, num_projs, dim, rng=None, device="cuda"):
         super().__init__()
         self.num_projs = num_projs
         self.feature_dim = dim[-1]
 
         if num_projs > 0:
             # proj_dir is a tensor of shape (*dim, num_projs)
-            self.register_buffer('proj_dir', torch.randn(dim + (num_projs,), generator=rng), persistent=False)
+            self.register_buffer(
+                "proj_dir",
+                torch.randn(dim + (num_projs,), generator=rng).to(device=device),
+                persistent=False,
+            )
             # Fixme: this seems to be a bug, perm should be a mapping from hash code to angular hash index.
             # perm is the angular hamming code sequence arranged in order
-            self.register_buffer('perm', self._unit_hamming_distance_array(self.num_projs), persistent=False)
+            self.register_buffer(
+                "perm",
+                self._unit_hamming_distance_array(self.num_projs).to(device=device),
+                persistent=False,
+            )
             # self.register_buffer('perm', self._hamming_code_to_order_mapping_perm(self.num_projs), persistent=False)
             # self.register_buffer('perm', torch.randperm(2 ** num_projs), persistent=False)
             # Example: num_projs=4, enc_vec=[[[[1, 2, 4, 8]]]]
-            self.register_buffer('enc_vec', 2 ** torch.arange(self.num_projs).view(1, 1, 1, -1), persistent=False)
+            self.register_buffer(
+                "enc_vec",
+                2 ** torch.arange(self.num_projs).view(1, 1, 1, -1).to(device=device),
+                persistent=False,
+            )
 
     def _unit_hamming_distance_array(self, size_n):
         if size_n == 1:
@@ -54,23 +65,33 @@ class AngularLSH(torch.nn.Module):
     def transform_key(self, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         key_norm = key.norm(dim=-1, dtype=key.dtype)
         key_norm_max = key_norm.max(dim=-1, keepdim=True).values
-        key_extra = torch.sqrt(key_norm_max ** 2 - key_norm ** 2)
+        key_extra = torch.sqrt(key_norm_max**2 - key_norm**2)
         key_qnf = torch.cat([key, key_extra.unsqueeze_(-1)], dim=-1)
         return key_qnf, key_norm_max
 
-    def transform_query(self, query: torch.Tensor, key_norm_max: torch.Tensor) -> torch.Tensor:
-        query_norm = torch.maximum(query.norm(dim=-1, dtype=query.dtype), torch.tensor([1e-6], dtype=query.dtype, device=query.device))
+    def transform_query(
+        self, query: torch.Tensor, key_norm_max: torch.Tensor
+    ) -> torch.Tensor:
+        query_norm = torch.maximum(
+            query.norm(dim=-1, dtype=query.dtype),
+            torch.tensor([1e-6], dtype=query.dtype, device=query.device),
+        )
         r = key_norm_max / query_norm
-        query_qnf = torch.cat([r.unsqueeze_(-1) * query, torch.zeros_like(query_norm).unsqueeze_(-1)], dim=-1)
+        query_qnf = torch.cat(
+            [r.unsqueeze_(-1) * query, torch.zeros_like(query_norm).unsqueeze_(-1)],
+            dim=-1,
+        )
         return query_qnf
 
     def hash(self, mat):
         if self.num_projs < 0:
             return torch.zeros(mat.shape[:-1], device=mat.device, dtype=torch.int32)
         # Feature vector along d is projected to the hyperplane defined by each projection vector
-        mask = torch.einsum('...nd,...dr -> ...nr', mat, self.proj_dir)
+        mask = torch.einsum("...nd,...dr -> ...nr", mat, self.proj_dir.to(mat.dtype))
         mask = mask > 0  # mask is the hamming code in binary form
-        bin_ids = (mask * self.enc_vec).sum(-1)  # bin_ids is the hamming code in integer form
+        bin_ids = (mask * self.enc_vec).sum(
+            -1
+        )  # bin_ids is the hamming code in integer form
         # Random index for our testing case.
         # bin_ids = torch.randint(2 ** self.num_projs, size=bin_ids.shape, device=bin_ids.device)
         # Ground truth index for our testing case.
