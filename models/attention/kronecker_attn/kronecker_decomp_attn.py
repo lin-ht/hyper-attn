@@ -33,7 +33,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         attn_calculator,
         sampling_ratio=1 / 30,
         sampling_mode="group",
-        row_replacing_mode="partial",  # "full",
+        row_replacing_mode="partial",  # full
     ):
         """
         Kronecker attention module.
@@ -257,6 +257,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         # den_p0 shape = [batch_size, head_size, 1, n_query_gp, 1]
         lse_p0 = lse_rep + math.log(n_key_groups)
 
+        # Early return if p0 quality is sufficient
         if self.return_point == "p0":
             attn_p0 = attn_p0.expand(-1, -1, n_query_groups, -1, -1).reshape(
                 *query.shape[:-1], -1
@@ -272,15 +273,27 @@ class KroneckerDecompAttention(torch.nn.Module):
         # Step 1: Column sampling
         # Step 1.0: Key residule guided column sampling
         # k_res shape: [batch_size, head_size, n_key_groups, n_key_gp, dim]
-        k_sub_ind_gps = KroneckerDecompAttention.normGuidedSampling(
-            k_res, ratio=self.sampling_ratio
-        )
-        k_sub_ind = k_sub_ind_gps.view(batch_size * head_size, n_key_groups, -1)
+        if self.sampling_mode == "group":
+            k_sub_ind_gps = KroneckerDecompAttention.normGuidedSampling(
+                k_res, ratio=self.sampling_ratio
+            )
+            k_sub_ind = k_sub_ind_gps.view(batch_size * head_size, n_key_groups, -1)
 
+        else:  # self.sampling_mode == "global"
+            k_sub_ind = KroneckerDecompAttention.normGuidedSampling(
+                k_res.view(batch_size * head_size, -1, dim), ratio=self.sampling_ratio
+            )
+
+        # k_rep_sub = utils.indexing(
+        #     torch.stack(
+        #         [k_rep.view(batch_size * head_size, -1, dim)] * n_key_groups, dim=1
+        #     ),
+        #     k_sub_ind,
+        # ).view(batch_size, head_size, -1, dim)
         k_rep_sub = utils.indexing(
-            torch.stack(
-                [k_rep.view(batch_size * head_size, -1, dim)] * n_key_groups, dim=1
-            ),
+            k_rep.view(batch_size * head_size, -1, dim)
+            .unsqueeze(1)
+            .expand(-1, n_key_groups, -1, -1),
             k_sub_ind,
         ).view(batch_size, head_size, -1, dim)
         k_sub = utils.indexing(
@@ -753,12 +766,12 @@ if __name__ == "__main__":
     # data = create_uniform_kronecker_qkv(QKV_LIST[qkv_id], 6, 6, sampling_ratio=1 / 5)
     test_kronecker_attn(*data, sampling_ratio=1 / 30, threshold=0.5)
 
-    # qkv_id = 0 Early return results:
+    # qkv_id = 1 Early return results:
     # R(attn_p2) 48.93%, R(lse_p2)  1.64%
     # R(attn_p1) 50.63%, R(lse_p1)  1.69%
     # R(attn_p0) 52.55%, R(lse_p0)  1.70%
     #
-    # qkv_id = 1 Early return results:
+    # qkv_id = 2 Early return results:
     # R(attn_p2) 36.68%, R(lse_p2)  3.36%
     # R(attn_p1) 37.96%, R(lse_p1)  3.48%
     # R(attn_p0) 39.17%, R(lse_p0)  3.52%
