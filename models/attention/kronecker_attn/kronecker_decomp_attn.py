@@ -34,6 +34,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         sampling_ratio=1 / 30,
         sampling_mode="group",
         row_replacing_mode="partial",  # full
+        zero_padded=False,
     ):
         """
         Kronecker attention module.
@@ -52,6 +53,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         self.sampling_mode = sampling_mode
         self.row_replacing_mode = row_replacing_mode
         self.return_point = "p2"
+        self.zero_padded = zero_padded
 
     @staticmethod
     def estimateKroneckerDecomps(
@@ -60,6 +62,7 @@ class KroneckerDecompAttention(torch.nn.Module):
         value,
         n_query_groups,
         n_key_groups,
+        zero_padded=False,
         config={
             "mode": "mean",
         },
@@ -117,8 +120,15 @@ class KroneckerDecompAttention(torch.nn.Module):
             query_rep = get_median_group(query_gps, sig_chns, sig_weights)
             key_rep = get_median_group(key_gps, sig_chns, sig_weights)
         else:
-            query_rep = query_gps.mean(dim=2, keepdim=True)
-            key_rep = key_gps.mean(dim=2, keepdim=True)
+            # Hack that deals with padding for odd number of frames with patch size 2
+            if zero_padded:
+                query_gps_ = query_gps[..., :-1, :, :]
+                key_gps_ = key_gps[..., :-1, :, :]
+                query_rep = query_gps_.mean(dim=2, keepdim=True)
+                key_rep = key_gps_.mean(dim=2, keepdim=True)
+            else:
+                query_rep = query_gps.mean(dim=2, keepdim=True)
+                key_rep = key_gps.mean(dim=2, keepdim=True)
 
         query_residual = query_gps - query_rep
         key_residual = key_gps - key_rep
