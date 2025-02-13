@@ -11,7 +11,7 @@ except ImportError as e:
     flash_attn_func_cuda = None
     print(f"flash_attn importError: {e}")
 
-DEBUG = True
+DEBUG = False
 AUTOTUNE = False
 
 def get_shape_from_layout(q, k, layout, cu_seqlens_q = None, cu_seqlens_k = None, max_seqlen_q=None, max_seqlen_k=None):
@@ -725,7 +725,7 @@ def attention_prefill_forward_triton_impl(
                     MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, VARLEN=is_varlen,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                     USE_ALIBI=False if alibi_slopes is None else True, ENABLE_DROPOUT=dropout_p>0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_scores,
-                    BLOCK_M=128, BLOCK_N=128, PRE_LOAD_V=False)
+                    BLOCK_M=128, BLOCK_N=128, PRE_LOAD_V=False, num_warps = 4 if head_size <= 64 else 8)
 
     return o, softmax_lse, exp_scores, grid, head_size, philox_seed, philox_offset, scores, scores_scaled_shifted
 

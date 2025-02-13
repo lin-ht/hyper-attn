@@ -103,7 +103,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
+    start_m = tl.program_id(0)  # seqlen // BLOCK_M
     off_hb = tl.program_id(1)  # nheads * batch
     off_b = off_hb // nheads
     off_h = off_hb % nheads
