@@ -53,6 +53,18 @@ def do_bench(fn, warmup, rep, mode:str='fwd'):
 
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
     q, k, v = get_tensors(batch_size, seq_len, head_size, dim)
+    
+    try:
+        if impl != "cuda":
+            rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
+            rst = flash_attn_func(q, k, v, None, causal, None)[0]
+            is_allclose = torch.allclose(rst, rst_expected)
+            max_err = (rst - rst_expected).abs().max()
+            mean_err = (rst - rst_expected).abs().mean()
+            print(f"[{impl}]Maximum error: {max_err}, Mean error: {mean_err}, Allclose: {is_allclose}")
+    except Exception as e:
+        print(f"Accuracy test exception: {e}")
+    
     if impl == "cuda":
         if flash_attn_func_cuda is None:
             raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
@@ -87,7 +99,7 @@ def main():
     for arg_name, arg_var in args.__dict__.items():
         print(f"{arg_name:<16} : {arg_var}")
 
-    seq_lens = [2**i for i in range(10, 18)]
+    seq_lens = [2**i for i in range(16, 18)]
 
     attn_method = args.attn_method # ['flash', 'hyper']
     attn_impl = args.impl # ['cuda', 'triton', 'xformers']
