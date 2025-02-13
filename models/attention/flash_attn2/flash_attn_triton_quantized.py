@@ -57,7 +57,7 @@ import triton.language as tl
 # )
 @triton.heuristics(
     {
-        "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
+        "EVEN_M": lambda args: True,
         "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
         "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
     }
@@ -69,12 +69,12 @@ def _fwd_kernel(
     V,
     Bias,
     Out,
-    Lse,
+    Lse,  # b, h, s
     TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     softmax_scale,
-    stride_qb,
-    stride_qh,
-    stride_qm,
+    stride_qb, # batch
+    stride_qh, # nheads
+    stride_qm, # seqlen
     stride_kb,
     stride_kh,
     stride_kn,
@@ -103,7 +103,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    start_m = tl.program_id(0)  # seqlen // BLOCK_M
+    start_m = 0  # seqlen // BLOCK_M
     off_hb = tl.program_id(1)  # nheads * batch
     off_b = off_hb // nheads
     off_h = off_hb % nheads
@@ -111,7 +111,7 @@ def _fwd_kernel(
     # off_h = tl.program_id(2)
     # off_hb = off_b * nheads + off_h
     # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = 0
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     # Initialize pointers to Q, K, V
@@ -119,7 +119,7 @@ def _fwd_kernel(
     # https://github.com/openai/triton/issues/741
     # I'm seeing a tiny bit of difference (5-7us)
     q_ptrs = (
-        Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
+        Q + off_b * stride_qb + off_h * stride_qh + offs_m * stride_qm + offs_d[None, :]
     )
     k_ptrs = (
         K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
@@ -127,15 +127,7 @@ def _fwd_kernel(
     v_ptrs = (
         V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
     )
-    if BIAS_TYPE == "vector":
-        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + offs_n
-    elif BIAS_TYPE == "matrix":
-        b_ptrs = (
-            Bias
-            + off_b * stride_bb
-            + off_h * stride_bh
-            + (offs_m[:, None] * stride_bm + offs_n[None, :])
-        )
+
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -144,18 +136,12 @@ def _fwd_kernel(
     # load q: it will stay in SRAM throughout
     # [2022-10-30] TD: Triton bug - in the case of EVEN_M=True and EVEN_N=False, if we just call
     # tl.load(q_ptrs), we get the wrong output!
-    if EVEN_M & EVEN_N:
-        if EVEN_HEADDIM:
-            q = tl.load(q_ptrs)
-        else:
-            q = tl.load(q_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+    
+    if EVEN_HEADDIM:
+        q = tl.load(q_ptrs)
     else:
-        if EVEN_HEADDIM:
-            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
-        else:
-            q = tl.load(
-                q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0
-            )
+        q = tl.load(q_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
@@ -184,36 +170,9 @@ def _fwd_kernel(
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
-        if IS_CAUSAL:
-            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
-        if BIAS_TYPE != "none":
-            if BIAS_TYPE == "vector":
-                if EVEN_N:
-                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
-                else:
-                    bias = tl.load(
-                        b_ptrs + start_n, mask=(start_n + offs_n) < seqlen_k, other=0.0
-                    ).to(tl.float32)
-                bias = bias[None, :]
-            elif BIAS_TYPE == "matrix":
-                if EVEN_M & EVEN_N:
-                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
-                else:
-                    bias = tl.load(
-                        b_ptrs + start_n,
-                        mask=(offs_m[:, None] < seqlen_q)
-                        & ((start_n + offs_n)[None, :] < seqlen_k),
-                        other=0.0,
-                    ).to(tl.float32)
-            # Slightly faster to multiply the softmax_scale in the tl.exp below since the compiler
-            # can then fuse the mult and add into an fma instruction. But if we have bias we need to
-            # to multiply with softmax_scale here.
-            qk = qk * softmax_scale + bias
-            m_ij = tl.maximum(tl.max(qk, 1), lse_i)
-            p = tl.exp(qk - m_ij[:, None])
-        else:
-            m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
-            p = tl.exp(qk * softmax_scale - m_ij[:, None])
+        
+        m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
+        p = tl.exp(qk * softmax_scale - m_ij[:, None])
         l_ij = tl.sum(p, 1)
 
         # scale acc_o
@@ -250,6 +209,7 @@ def _fwd_kernel(
         m_i = m_ij
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
+    # end of for start_n in range(0, end_n, BLOCK_N):
 
     o_scale = tl.exp(m_i - lse_i)
     # BUG: have to store and immediately load
@@ -257,8 +217,8 @@ def _fwd_kernel(
     o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
     # rematerialize offsets to save registers
-    start_m = tl.program_id(0)
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    start_m = 0
+    offs_m = 0
     # write back l and m
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
     tl.store(lse_ptrs, lse_i)
@@ -268,21 +228,13 @@ def _fwd_kernel(
         Out
         + off_b * stride_ob
         + off_h * stride_oh
-        + (offs_m[:, None] * stride_om + offs_d[None, :])
+        + offs_d[None, :]
     )
-    if EVEN_M:
-        if EVEN_HEADDIM:
-            tl.store(out_ptrs, acc_o)
-        else:
-            tl.store(out_ptrs, acc_o, mask=offs_d[None, :] < headdim)
+    
+    if EVEN_HEADDIM:
+        tl.store(out_ptrs, acc_o)
     else:
-        if EVEN_HEADDIM:
-            tl.store(out_ptrs, acc_o, mask=offs_m[:, None] < seqlen_q)
-        else:
-            tl.store(
-                out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
-            )
-
+        tl.store(out_ptrs, acc_o, mask=offs_d[None, :] < headdim)
 
 @triton.jit
 def _bwd_preprocess_do_o_dot(
@@ -864,7 +816,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
     BLOCK_M = 1
     BLOCK_N = 128
     num_warps = 4 if d <= 64 else 8
-    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_N"]), batch * nheads)
+    grid = lambda META: (1, batch * nheads)
     _fwd_kernel[grid](
         q,
         k,
@@ -874,9 +826,9 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
         lse,
         tmp,
         softmax_scale,
-        q.stride(0),
-        q.stride(2),
-        q.stride(1),
+        q.stride(0), # stride_b
+        q.stride(2), # stride_h
+        q.stride(1), # stride_s
         k.stride(0),
         k.stride(2),
         k.stride(1),

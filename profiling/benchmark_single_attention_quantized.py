@@ -21,7 +21,7 @@ def get_arguments():
     parser.add_argument("--mode", type=str, default="fwd", choices=['fwd', 'bwd', 'fwd+bwd'])
     parser.add_argument("--attn_method", type=str, default="flash", choices=['flash', 'hyper'])
     parser.add_argument("--impl", type=str, default="triton", choices=['cuda', 'triton', 'amd', 'xformers'])
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--head_size", type=int, default=32)
     parser.add_argument("--dim", type=int, default=64)
     return parser.parse_args()
