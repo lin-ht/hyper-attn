@@ -4,6 +4,7 @@ from tqdm import tqdm
 import torch
 import triton
 
+from attention.flash_attn2.flash_attn_triton_amd import flash_attn_func as flash_attn_func_amd
 from attention.flash_attn2.flash_attn_triton_for_hyper import flash_attn_func
 from attention.hyper_attn.hyper_attn import HyperAttention
 from attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
@@ -17,9 +18,9 @@ except ImportError as e:
 def get_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no_causal", action="store_true")
-    parser.add_argument("--mode", type=str, default="fwd+bwd", choices=['fwd', 'bwd', 'fwd+bwd'])
+    parser.add_argument("--mode", type=str, default="fwd", choices=['fwd', 'bwd', 'fwd+bwd'])
     parser.add_argument("--attn_method", type=str, default="flash", choices=['flash', 'hyper'])
-    parser.add_argument("--impl", type=str, default="cuda", choices=['cuda', 'triton', 'xformers'])
+    parser.add_argument("--impl", type=str, default="triton", choices=['cuda', 'triton', 'amd', 'xformers'])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--head_size", type=int, default=32)
     parser.add_argument("--dim", type=int, default=64)
@@ -57,7 +58,12 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
     try:
         if impl != "cuda":
             rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
-            rst = flash_attn_func(q, k, v, None, causal, None)[0]
+        
+            if impl == "triton":
+                rst = flash_attn_func(q, k, v, None, causal, None)[0]
+            elif impl == "amd":
+                rst = flash_attn_func_amd(q, k, v, causal)[0]
+
             is_allclose = torch.allclose(rst, rst_expected)
             max_err = (rst - rst_expected).abs().max()
             mean_err = (rst - rst_expected).abs().mean()
@@ -71,6 +77,8 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
         fn = lambda: flash_attn_func_cuda(q, k, v, causal=causal)
     elif impl == "triton":
         fn = lambda: flash_attn_func(q, k, v, None, causal, None)[0]
+    elif impl == "amd":
+        fn = lambda: flash_attn_func_amd(q, k, v, causal)[0]
     else:  # impl == "xformers"
         fn = lambda: flash_attn_func_xformers(q, k, v, None, causal, None)[0]
 
