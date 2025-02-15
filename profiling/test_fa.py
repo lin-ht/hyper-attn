@@ -131,7 +131,10 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
         
             if impl == "triton":
-                rst = flash_attn_func(q, k, v, None, causal, None)[0]
+                k_bits = 2
+                k_ind_encoded = encode_torch(k_ind, k_bits)
+                rst = flash_attn_func(q, k_ind_encoded, v, k_bits, k_lut, None, causal, None)[0]
+                # rst = flash_attn_func(q, k, v, None, causal, None)[0]
                 print("flash attn output shape:", rst.shape)
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
@@ -148,7 +151,8 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
         fn = lambda: flash_attn_func_cuda(q, k, v, causal=causal)
     elif impl == "triton":
-        fn = lambda: flash_attn_func(q, k, v, None, causal, None)[0]
+        
+        fn = lambda: flash_attn_func(q, k_ind_encoded, v, k_bits, k_lut, None, causal, None)[0]
     elif impl == "amd":
         fn = lambda: flash_attn_func_amd(q, k, v, causal)[0]
     else:  # impl == "xformers"
@@ -188,7 +192,8 @@ def main():
     batch_size, head_size, dim = args.batch_size, args.head_size, args.dim
     print(f"mode: {mode}, attn_method: {attn_method}-{attn_impl}, batch_size: {batch_size}, head_size: {head_size}, dim: {dim}")
 
-    causal = not args.no_causal
+    # causal = not args.no_causal
+    causal = False
 
     for seq_len in seq_lens:
         if attn_method == 'flash':

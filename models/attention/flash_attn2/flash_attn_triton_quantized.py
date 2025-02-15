@@ -97,6 +97,8 @@ def _fwd_kernel(
     headdim,
     CACHE_KEY_SEQLEN_Q,
     CACHE_KEY_SEQLEN_K,
+    K_BITS: tl.constexpr,
+    K_RANGE: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -117,6 +119,8 @@ def _fwd_kernel(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
+    offs_d_k = tl.arange(0, BLOCK_HEADDIM//K_RANGE)
+    offs_d_k_range = tl.arange(0, K_RANGE)
     # Initialize pointers to Q, K, V
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
     # https://github.com/openai/triton/issues/741
@@ -125,7 +129,7 @@ def _fwd_kernel(
         Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
     ) # [1, BLOCK_HEADDIM]
     k_ptrs = (
-        K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
+        K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d_k[None, :])
     ) # [BLOCK_N, BLOCK_HEADDIM]
     v_ptrs = (
         V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
@@ -154,23 +158,27 @@ def _fwd_kernel(
             if EVEN_HEADDIM:
                 k = tl.load(k_ptrs + start_n * stride_kn)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0.0)
+                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0)
         else:
             if EVEN_HEADDIM:
                 k = tl.load(
                     k_ptrs + start_n * stride_kn,
                     mask=(start_n + offs_n)[:, None] < seqlen_k,
-                    other=0.0,
+                    other=0,
                 )
             else:
                 k = tl.load(
                     k_ptrs + start_n * stride_kn,
                     mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-                    other=0.0,
+                    other=0,
                 )
+        # dequantize k
+        k_ind = tl.cast((k[:, :, None] >> ((K_RANGE - offs_d_k_range[None, None, :] - 1) * K_BITS)) & ((1 << K_BITS) - 1), tl.uint8)
+        k_ind = tl.reshape(k_ind, [BLOCK_N, BLOCK_HEADDIM])
+
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # qk += tl.dot(q, tl.trans(k))
-        qk += tl.reshape(tl.sum(q * k, axis=1), [BLOCK_M, BLOCK_N])
+        qk += tl.reshape(tl.sum(q * k_ind, axis=-1), [BLOCK_M, BLOCK_N])
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
@@ -780,14 +788,17 @@ def _bwd_kernel(
 def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax_scale=None):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
+    k_range = 2**k_bits
     assert seqlen_q == 1, "Only support special case: seqlen_q=1"
     assert bias is None, "Bias not supported"
     
-    _, seqlen_k, _, _ = k.shape
-    assert k.shape == (batch, seqlen_k, nheads, d)
+    _, seqlen_k, _, d_k = k.shape
+    assert d == d_k * k_range, f"d(={d}) must be d_k(={d_k}) * k_range(={k_range})"
+    assert k.shape == (batch, seqlen_k, nheads, d_k)
     assert v.shape == (batch, seqlen_k, nheads, d)
     assert d <= 128, "FlashAttention only support head dimensions up to 128"
-    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
+    # assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
+    assert k.dtype in [torch.uint8], "k encoded type must be uint8"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
@@ -812,14 +823,15 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
     seqlen_q_rounded = seqlen_q # math.ceil(seqlen_q / 128) * 128
-    lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
-    tmp = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    lse = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
+    tmp = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
     o = torch.empty_like(q)
 
     k_lut_elems = 2**k_bits
     assert k_lut_elems == k_lut.shape[1], "k_lut_elems must match k_lut shape"
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+    assert BLOCK_HEADDIM % k_range == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_range(={k_range})"
     BLOCK_M = 1
     BLOCK_N = 128
     num_warps = 4 if d <= 64 else 8
@@ -858,6 +870,8 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         seqlen_k // 32,  # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
+        k_bits,
+        k_range,
         bias_type,
         causal,
         BLOCK_HEADDIM,
@@ -1135,14 +1149,13 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, None, None, None
 
 
-flash_attn_func_apply = FlashAttnFunc.apply
+flash_attn_func = FlashAttnFunc.apply
 
-
-def flash_attn_func(q, k, v, bias=None, causal=False, softmax_scale=None):
-    k_bits = 2
-    k_lut = torch.zeros(q.shape[0], 2**k_bits, device=q.device, dtype=q.dtype)
-    return flash_attn_func_apply(q, k, v, k_bits, k_lut, bias, causal, softmax_scale)
-
+# flash_attn_func_apply = FlashAttnFunc.apply
+# def flash_attn_func(q, k, v, bias=None, causal=False, softmax_scale=None):
+#     k_bits = 2
+#     k_lut = torch.zeros(q.shape[0], 2**k_bits, device=q.device, dtype=q.dtype)
+#     return flash_attn_func_apply(q, k, v, k_bits, k_lut, bias, causal, softmax_scale)
 
 from attention.flash_attn2.quantization import quantize, dequantize, prepare_data, test_quantization2
 
