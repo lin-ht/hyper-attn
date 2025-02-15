@@ -27,10 +27,10 @@ def get_arguments():
     return parser.parse_args()
 
 
-def get_tensors(batch_size, head_size, seq_len, dim):
-    q = torch.randn((batch_size, head_size, seq_len, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    k = torch.randn((batch_size, head_size, seq_len, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    v = torch.randn((batch_size, head_size, seq_len, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+def get_tensors(batch_size, seq_len, head_size, dim):
+    q = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     return q, k, v
 
 

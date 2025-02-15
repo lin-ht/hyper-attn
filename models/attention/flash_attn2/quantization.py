@@ -188,8 +188,8 @@ def test_quantization2(bits, batch_size, seq_len, hn, dh):
     k_encoded_torch = torch.zeros(k_ind_v.shape[0], k_ind_v.shape[1], dtype=torch.uint8, device=k_ind_v.device)
     for bit_pos in range(compression_scale):
         k_encoded_torch |= (k_ind_v[..., bit_pos].squeeze(dim=-1)) << ((compression_scale - 1 - bit_pos) * bits)
-    print(f"{k_encoded_torch.shape=}, {k_encoded_torch[0, 0:4]=}")
-    print(f"{k_encoded.shape=},             {k_encoded[0, 0:4]=}")
+    print(f"{k_encoded_torch.shape=}, {k_encoded_torch[120, 3728082:3728086]=}")
+    print(f"{k_encoded.shape=},             {k_encoded[120, 3728082:3728086]=}")
     torch.testing.assert_close(k_encoded, k_encoded_torch)
 
     # Decoding in torch

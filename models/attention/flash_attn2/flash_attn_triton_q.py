@@ -57,7 +57,7 @@ import triton.language as tl
 # )
 @triton.heuristics(
     {
-        "EVEN_M": lambda args: True,
+        "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
         "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
         "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
     }
@@ -69,14 +69,12 @@ def _fwd_kernel(
     V,
     Bias,
     Out,
-    Lse,  # b, h, s
+    Lse,
     TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
-    K_lut,  # b, elements, e.g. 2 bits, shape is [b, 4]
-    K_lut_elems,  # number of elements per batch in K_lut, e.g. 4
     softmax_scale,
-    stride_qb, # batch
-    stride_qh, # nheads
-    stride_qm, # seqlen
+    stride_qb,
+    stride_qh,
+    stride_qm,
     stride_kb,
     stride_kh,
     stride_kn,
@@ -89,7 +87,6 @@ def _fwd_kernel(
     stride_ob,
     stride_oh,
     stride_om,
-    stride_klb,
     nheads,
     seqlen_q,
     seqlen_k,
@@ -106,7 +103,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    start_m = 0  # seqlen // BLOCK_M
+    start_m = tl.program_id(0)  # seqlen // BLOCK_M
     off_hb = tl.program_id(1)  # nheads * batch
     off_b = off_hb // nheads
     off_h = off_hb % nheads
@@ -123,14 +120,22 @@ def _fwd_kernel(
     # I'm seeing a tiny bit of difference (5-7us)
     q_ptrs = (
         Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    ) # [1, BLOCK_HEADDIM]
+    )
     k_ptrs = (
         K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    ) # [BLOCK_N, BLOCK_HEADDIM]
+    )
     v_ptrs = (
         V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
     )
-
+    if BIAS_TYPE == "vector":
+        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + offs_n
+    elif BIAS_TYPE == "matrix":
+        b_ptrs = (
+            Bias
+            + off_b * stride_bb
+            + off_h * stride_bh
+            + (offs_m[:, None] * stride_bm + offs_n[None, :])
+        )
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -139,12 +144,18 @@ def _fwd_kernel(
     # load q: it will stay in SRAM throughout
     # [2022-10-30] TD: Triton bug - in the case of EVEN_M=True and EVEN_N=False, if we just call
     # tl.load(q_ptrs), we get the wrong output!
-    
-    if EVEN_HEADDIM:
-        q = tl.load(q_ptrs)
+    if EVEN_M & EVEN_N:
+        if EVEN_HEADDIM:
+            q = tl.load(q_ptrs)
+        else:
+            q = tl.load(q_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
     else:
-        q = tl.load(q_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
-
+        if EVEN_HEADDIM:
+            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
+        else:
+            q = tl.load(
+                q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0
+            )
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
@@ -169,15 +180,41 @@ def _fwd_kernel(
                     other=0.0,
                 )
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        # qk += tl.dot(q, tl.trans(k))
-        qk += tl.reshape(tl.sum(q * k, axis=1), [BLOCK_M, BLOCK_N])
+        qk += tl.dot(q, tl.trans(k))
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
-        
-        m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i) # [BLOCK_M]
-        p = tl.exp(qk * softmax_scale - m_ij[:, None]) # [BLOCK_M, BLOCK_N]
-        l_ij = tl.sum(p, 1) # [BLOCK_M]
+        if IS_CAUSAL:
+            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
+        if BIAS_TYPE != "none":
+            if BIAS_TYPE == "vector":
+                if EVEN_N:
+                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                else:
+                    bias = tl.load(
+                        b_ptrs + start_n, mask=(start_n + offs_n) < seqlen_k, other=0.0
+                    ).to(tl.float32)
+                bias = bias[None, :]
+            elif BIAS_TYPE == "matrix":
+                if EVEN_M & EVEN_N:
+                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                else:
+                    bias = tl.load(
+                        b_ptrs + start_n,
+                        mask=(offs_m[:, None] < seqlen_q)
+                        & ((start_n + offs_n)[None, :] < seqlen_k),
+                        other=0.0,
+                    ).to(tl.float32)
+            # Slightly faster to multiply the softmax_scale in the tl.exp below since the compiler
+            # can then fuse the mult and add into an fma instruction. But if we have bias we need to
+            # to multiply with softmax_scale here.
+            qk = qk * softmax_scale + bias
+            m_ij = tl.maximum(tl.max(qk, 1), lse_i)
+            p = tl.exp(qk - m_ij[:, None])
+        else:
+            m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
+            p = tl.exp(qk * softmax_scale - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
 
         # scale acc_o
         acc_o_scale = tl.exp(m_i - m_ij)
@@ -207,13 +244,12 @@ def _fwd_kernel(
                     other=0.0,
                 )
         p = p.to(v.dtype)
-        acc_o += tl.sum(tl.trans(p) * v, 0) # acc_o += tl.dot(p, v) # v: [BLOCK_N, BLOCK_HEADDIM]
+        acc_o += tl.dot(p, v)
 
         # -- update statistics
         m_i = m_ij
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
-    # end of for start_n in range(0, end_n, BLOCK_N):
 
     o_scale = tl.exp(m_i - lse_i)
     # BUG: have to store and immediately load
@@ -221,7 +257,7 @@ def _fwd_kernel(
     o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
     # rematerialize offsets to save registers
-    start_m = 0
+    start_m = tl.program_id(0)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     # write back l and m
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
@@ -234,11 +270,19 @@ def _fwd_kernel(
         + off_h * stride_oh
         + (offs_m[:, None] * stride_om + offs_d[None, :])
     )
-    
-    if EVEN_HEADDIM:
-        tl.store(out_ptrs, acc_o.to(tl.float16))
+    if EVEN_M:
+        if EVEN_HEADDIM:
+            tl.store(out_ptrs, acc_o)
+        else:
+            tl.store(out_ptrs, acc_o, mask=offs_d[None, :] < headdim)
     else:
-        tl.store(out_ptrs, acc_o.to(tl.float16), mask=offs_d[None, :] < headdim)
+        if EVEN_HEADDIM:
+            tl.store(out_ptrs, acc_o, mask=offs_m[:, None] < seqlen_q)
+        else:
+            tl.store(
+                out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
+            )
+
 
 @triton.jit
 def _bwd_preprocess_do_o_dot(
@@ -777,12 +821,9 @@ def _bwd_kernel(
         )
 
 
-def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
-    assert seqlen_q == 1, "Only support special case: seqlen_q=1"
-    assert bias is None, "Bias not supported"
-    
     _, seqlen_k, _, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
@@ -811,19 +852,15 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
-    seqlen_q_rounded = seqlen_q # math.ceil(seqlen_q / 128) * 128
+    seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
     tmp = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
     o = torch.empty_like(q)
 
-    k_lut_elems = 2**k_bits
-    assert k_lut_elems == k_lut.shape[1], "k_lut_elems must match k_lut shape"
-
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    BLOCK_M = 1
-    BLOCK_N = 128
+    BLOCK = 128
     num_warps = 4 if d <= 64 else 8
-    grid = lambda META: (1, batch * nheads)
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
     _fwd_kernel[grid](
         q,
         k,
@@ -832,12 +869,10 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         o,
         lse,
         tmp,
-        k_lut, 
-        k_lut_elems,
         softmax_scale,
-        q.stride(0), # stride_b
-        q.stride(2), # stride_h
-        q.stride(1), # stride_s
+        q.stride(0),
+        q.stride(2),
+        q.stride(1),
         k.stride(0),
         k.stride(2),
         k.stride(1),
@@ -848,7 +883,6 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         o.stride(0),
         o.stride(2),
         o.stride(1),
-        k_lut.stride(0),
         nheads,
         seqlen_q,
         seqlen_k,
@@ -861,8 +895,8 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         bias_type,
         causal,
         BLOCK_HEADDIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=BLOCK,
+        BLOCK_N=BLOCK,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -1091,7 +1125,7 @@ def _flash_attn_backward(
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, k_bits, k_lut, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, q, k, v, bias=None, causal=False, softmax_scale=None):
         """
         q: (batch_size, seqlen_q, nheads, headdim)
         k, v: (batch_size, seqlen_k, nheads, headdim)
@@ -1102,7 +1136,7 @@ class FlashAttnFunc(torch.autograd.Function):
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
         o, lse, ctx.softmax_scale = _flash_attn_forward(
-            q, k, v, k_bits, k_lut, bias=bias, causal=causal, softmax_scale=softmax_scale
+            q, k, v, bias=bias, causal=causal, softmax_scale=softmax_scale
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
@@ -1137,46 +1171,3 @@ class FlashAttnFunc(torch.autograd.Function):
 
 flash_attn_func = FlashAttnFunc.apply
 
-
-from attention.flash_attn2.quantization import quantize, dequantize, prepare_data, test_quantization2
-
-def test_flash_attn_quantized(bits = 2, batch_size = 2, seq_len = 1024, hn = 32, dh = 256):
-    # test_quantization2(bits, batch_size, seq_len, hn, dh)
-    dtype = torch.float16
-    device = "cuda"
-
-    RTOL = 1e-4 if dtype == torch.float else 1e-2
-    ATOL = 1e-4 if dtype == torch.float else 1e-2
-
-    k_org, k_deq, k_ind, k_lut, k_min, k_max, _, _ = prepare_data(bits, batch_size, seq_len, hn, dh, dtype=dtype, device=device)
-
-    compression_scale = 8 // bits
-    # k_ind_v = k_ind.view(batch_size, -1)
-    # assert k_ind_v.shape[-1] % compression_scale == 0, f"Unsupported shape {k_ind_v.shape}"
-    # k_ind_v = k_ind.view(batch_size, -1, compression_scale)
-    # k_encoded = quantize(k_ind_v, bits) # k_encoded dtype = uint8
-
-    # k_encoded_v = k_encoded.view(batch_size, -1)
-    # print(f"{k_encoded_v.shape=}, {k_encoded_v[0:2, 0:4]=}")
-    
-    # k_decoded = dequantize(k_encoded, k_lut, bits).reshape(k_deq.shape)
-    # torch.testing.assert_close(k_deq.to(device=k_decoded.device), k_decoded, rtol=RTOL, atol=ATOL)
-
-    
-    q = torch.randn((batch_size, 1, hn, dh), dtype=dtype, device=device, requires_grad=False)
-    v = torch.randn((batch_size, seq_len, hn, dh), dtype=dtype, device=device, requires_grad=False)
-    print(f"{q.shape=}, {k_org.shape=}, {v.shape=}")
-
-    flash_attn_func(q, k_org, v, bits, k_lut, None, False, None)
-
-    print("Passed!")
-
-
-if __name__ == "__main__":
-    bits = 2
-    batch_size = 128
-    seq_len = 3072 
-    hn = 48 # 32
-    dh = 128
-
-    test_flash_attn_quantized(bits, batch_size, seq_len, hn, dh)
