@@ -99,8 +99,7 @@ def get_tensors(batch_size, seq_len, head_size, dim):
     k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-    k_deq, k_ind, k_lut, k_min, k_max, k_scales, k_zero_points = run_quantization(k, bits=2)
-    return q, k, v, k_deq, k_ind, k_lut, k_scales, k_zero_points
+    return q, k, v
 
 
 def do_bench(fn, warmup, rep, mode:str='fwd'):
@@ -122,12 +121,17 @@ def do_bench(fn, warmup, rep, mode:str='fwd'):
 
 
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
-    q, k, v, k_deq, k_ind, k_lut, k_scales, k_zero_points = get_tensors(batch_size, seq_len, head_size, dim)
+    q, k, v = get_tensors(batch_size, seq_len, head_size, dim)
+    k_bits = 1
+    v_bits = 2
+    k_deq, k_ind, k_lut, k_min, k_max, k_scales, k_zero_points = run_quantization(k, bits=k_bits)
+    v_deq, v_ind, v_lut, v_min, v_max, v_scales, v_zero_points = run_quantization(v, bits=v_bits)
 
-    k_bits = 2
     k_ind_encoded = encode_torch(k_ind, k_bits)
+    v_ind_encoded = encode_torch(v_ind, v_bits)
 
     k = k_deq.to(q.dtype)
+    v = v_deq.to(q.dtype)
     
     try:
         if impl != "cuda":

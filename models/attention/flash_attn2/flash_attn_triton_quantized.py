@@ -97,7 +97,7 @@ def _fwd_kernel(
     CACHE_KEY_SEQLEN_Q,
     CACHE_KEY_SEQLEN_K,
     K_BITS: tl.constexpr,
-    K_RANGE: tl.constexpr,
+    K_CNTS: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -118,8 +118,8 @@ def _fwd_kernel(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
-    offs_d_k = tl.arange(0, BLOCK_HEADDIM//K_RANGE)
-    offs_d_k_range = tl.arange(0, K_RANGE)
+    offs_d_k = tl.arange(0, BLOCK_HEADDIM//K_CNTS)
+    offs_d_k_cnts = tl.arange(0, K_CNTS)
     # Initialize pointers to Q, K, V
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
     # https://github.com/openai/triton/issues/741
@@ -177,7 +177,9 @@ def _fwd_kernel(
                     other=0,
                 )
         # dequantize k
-        k_ind = tl.cast((k[:, :, None] >> ((K_RANGE - offs_d_k_range[None, None, :] - 1) * K_BITS)) & ((1 << K_BITS) - 1), tl.uint8)
+        K_BITS_MASK: tl.constexpr = ((1 << K_BITS) - 1)
+        K_BITS_BASE: tl.constexpr = (K_CNTS - 1) * K_BITS
+        k_ind = (k[:, :, None] >> (K_BITS_BASE - offs_d_k_cnts[None, None, :]* K_BITS)) & K_BITS_MASK
         k_ind = tl.reshape(k_ind, [BLOCK_N, BLOCK_HEADDIM])
 
         k_decoded = (k_ind - k_zero_points) / k_scales
@@ -795,12 +797,12 @@ def _bwd_kernel(
 def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, causal=False, softmax_scale=None):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
-    k_range = 2**k_bits
+    k_cnts = 8 // k_bits
     assert seqlen_q == 1, "Only support special case: seqlen_q=1"
     assert bias is None, "Bias not supported"
     
     _, seqlen_k, _, d_k = k.shape
-    assert d == d_k * k_range, f"d(={d}) must be d_k(={d_k}) * k_range(={k_range})"
+    assert d == d_k * k_cnts, f"d(={d}) must be d_k(={d_k}) * k_cnts(={k_cnts})"
     assert k.shape == (batch, seqlen_k, nheads, d_k)
     assert v.shape == (batch, seqlen_k, nheads, d)
     assert d <= 128, "FlashAttention only support head dimensions up to 128"
@@ -835,7 +837,7 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, cau
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    assert BLOCK_HEADDIM % k_range == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_range(={k_range})"
+    assert BLOCK_HEADDIM % k_cnts == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_cnts(={k_cnts})"
     BLOCK_M = 1
     BLOCK_N = 128
     num_warps = 4 if d <= 64 else 8
@@ -874,7 +876,7 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, cau
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         k_bits,
-        k_range,
+        k_cnts,
         bias_type,
         causal,
         BLOCK_HEADDIM,
