@@ -73,6 +73,8 @@ def _fwd_kernel(
     TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     K_scales,  # b
     K_zero_points,  # b
+    V_scales,  # b
+    V_zero_points,  # b
     softmax_scale,
     stride_qb, # batch
     stride_qh, # nheads
@@ -98,6 +100,8 @@ def _fwd_kernel(
     CACHE_KEY_SEQLEN_K,
     K_BITS: tl.constexpr,
     K_CNTS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    V_CNTS: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -119,7 +123,9 @@ def _fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     offs_d_k = tl.arange(0, BLOCK_HEADDIM//K_CNTS)
+    offs_d_v = tl.arange(0, BLOCK_HEADDIM//V_CNTS)
     offs_d_k_cnts = tl.arange(0, K_CNTS)
+    offs_d_v_cnts = tl.arange(0, V_CNTS)
     # Initialize pointers to Q, K, V
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
     # https://github.com/openai/triton/issues/741
@@ -131,13 +137,18 @@ def _fwd_kernel(
         K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d_k[None, :])
     ) # [BLOCK_N, BLOCK_HEADDIM]
     v_ptrs = (
-        V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
+        V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d_v[None, :])
     )
 
     k_scales_ptr = K_scales + off_b
     k_zero_points_ptr = K_zero_points + off_b
     k_scales = tl.load(k_scales_ptr)
     k_zero_points = tl.load(k_zero_points_ptr)
+
+    v_scales_ptr = V_scales + off_b
+    v_zero_points_ptr = V_zero_points + off_b
+    v_scales = tl.load(v_scales_ptr)
+    v_zero_points = tl.load(v_zero_points_ptr)
 
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
@@ -177,6 +188,7 @@ def _fwd_kernel(
                     other=0,
                 )
         # dequantize k
+        tl.debug_barrier()
         K_BITS_MASK: tl.constexpr = ((1 << K_BITS) - 1)
         K_BITS_BASE: tl.constexpr = (K_CNTS - 1) * K_BITS
         k_ind = (k[:, :, None] >> (K_BITS_BASE - offs_d_k_cnts[None, None, :]* K_BITS)) & K_BITS_MASK
@@ -223,8 +235,17 @@ def _fwd_kernel(
                     mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                     other=0.0,
                 )
-        p = p.to(v.dtype)
-        acc_o += tl.sum(tl.trans(p) * v, 0) # acc_o += tl.dot(p, v) # v: [BLOCK_N, BLOCK_HEADDIM]
+        # dequantize v
+        tl.debug_barrier()
+        V_BITS_MASK: tl.constexpr = ((1 << V_BITS) - 1)
+        V_BITS_BASE: tl.constexpr = (V_CNTS - 1) * V_BITS
+        v_ind = (v[:, :, None] >> (V_BITS_BASE - offs_d_v_cnts[None, None, :]* V_BITS)) & V_BITS_MASK
+        v_ind = tl.reshape(v_ind, [BLOCK_N, BLOCK_HEADDIM])
+
+        v_decoded = (v_ind - v_zero_points) / v_scales
+        
+        # p = p.to(v.dtype)
+        acc_o += tl.sum(tl.trans(p) * v_decoded, 0) # acc_o += tl.dot(p, v) # v: [BLOCK_N, BLOCK_HEADDIM]
 
         # -- update statistics
         m_i = m_ij
@@ -794,20 +815,24 @@ def _bwd_kernel(
         )
 
 
-def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, bias=None, causal=False, softmax_scale=None):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
     k_cnts = 8 // k_bits
+    v_cnts = 8 // v_bits
     assert seqlen_q == 1, "Only support special case: seqlen_q=1"
     assert bias is None, "Bias not supported"
     
     _, seqlen_k, _, d_k = k.shape
+    _, seqlen_v, _, d_v = v.shape
     assert d == d_k * k_cnts, f"d(={d}) must be d_k(={d_k}) * k_cnts(={k_cnts})"
+    assert d == d_v * v_cnts, f"d(={d}) must be d_v(={d_v}) * v_cnts(={v_cnts})"
     assert k.shape == (batch, seqlen_k, nheads, d_k)
-    assert v.shape == (batch, seqlen_k, nheads, d)
+    assert v.shape == (batch, seqlen_k, nheads, d_v)
     assert d <= 128, "FlashAttention only support head dimensions up to 128"
     # assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert k.dtype in [torch.uint8], "k encoded type must be uint8"
+    assert v.dtype in [torch.uint8], "v encoded type must be uint8"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
@@ -852,6 +877,8 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, cau
         tmp,
         k_scales, # 1D
         k_zero_points, # 1D
+        v_scales, # 1D
+        v_zero_points, # 1D
         softmax_scale,
         q.stride(0), # stride_b
         q.stride(2), # stride_h
@@ -877,6 +904,8 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, cau
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         k_bits,
         k_cnts,
+        v_bits,
+        v_cnts,
         bias_type,
         causal,
         BLOCK_HEADDIM,
@@ -1110,7 +1139,7 @@ def _flash_attn_backward(
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, k_bits, k_scales, k_zero_points, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, bias=None, causal=False, softmax_scale=None):
         """
         q: (batch_size, seqlen_q, nheads, headdim)
         k, v: (batch_size, seqlen_k, nheads, headdim)
@@ -1121,7 +1150,7 @@ class FlashAttnFunc(torch.autograd.Function):
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
         o, lse, ctx.softmax_scale = _flash_attn_forward(
-            q, k, v, k_bits, k_scales, k_zero_points, bias=bias, causal=causal, softmax_scale=softmax_scale
+            q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, bias=bias, causal=causal, softmax_scale=softmax_scale
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
