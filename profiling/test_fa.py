@@ -99,8 +99,8 @@ def get_tensors(batch_size, seq_len, head_size, dim):
     k = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     v = torch.randn((batch_size, seq_len, head_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-    k_deq, k_ind, k_lut, k_min, k_max, k_scale, k_zero_point = run_quantization(k, bits=2)
-    return q, k, v, k_deq, k_ind, k_lut, k_scale, k_zero_point
+    k_deq, k_ind, k_lut, k_min, k_max, k_scales, k_zero_points = run_quantization(k, bits=2)
+    return q, k, v, k_deq, k_ind, k_lut, k_scales, k_zero_points
 
 
 def do_bench(fn, warmup, rep, mode:str='fwd'):
@@ -122,18 +122,19 @@ def do_bench(fn, warmup, rep, mode:str='fwd'):
 
 
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
-    q, k, v, k_deq, k_ind, k_lut, k_scale, k_zero_point = get_tensors(batch_size, seq_len, head_size, dim)
+    q, k, v, k_deq, k_ind, k_lut, k_scales, k_zero_points = get_tensors(batch_size, seq_len, head_size, dim)
 
-    k = k_ind.to(q.dtype)
+    k_bits = 2
+    k_ind_encoded = encode_torch(k_ind, k_bits)
+
+    k = k_deq.to(q.dtype)
     
     try:
         if impl != "cuda":
             rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
         
             if impl == "triton":
-                k_bits = 2
-                k_ind_encoded = encode_torch(k_ind, k_bits)
-                rst = flash_attn_func(q, k_ind_encoded, v, k_bits, k_lut, None, causal, None)[0]
+                rst = flash_attn_func(q, k_ind_encoded, v, k_bits, k_scales, k_zero_points, None, causal, None)[0]
                 # rst = flash_attn_func(q, k, v, None, causal, None)[0]
                 print("flash attn output shape:", rst.shape)
             elif impl == "amd":
@@ -151,8 +152,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
         fn = lambda: flash_attn_func_cuda(q, k, v, causal=causal)
     elif impl == "triton":
-        
-        fn = lambda: flash_attn_func(q, k_ind_encoded, v, k_bits, k_lut, None, causal, None)[0]
+        fn = lambda: flash_attn_func(q, k_ind_encoded, v, k_bits, k_scales, k_zero_points, None, causal, None)[0]
     elif impl == "amd":
         fn = lambda: flash_attn_func_amd(q, k, v, causal)[0]
     else:  # impl == "xformers"
@@ -184,7 +184,7 @@ def main():
         print(f"{arg_name:<16} : {arg_var}")
 
     # seq_lens = [2**i for i in range(16, 18)]
-    seq_lens = [2500, 3328]
+    seq_lens = [2777, 3328]
 
     attn_method = args.attn_method # ['flash', 'hyper']
     attn_impl = args.impl # ['cuda', 'triton', 'xformers']

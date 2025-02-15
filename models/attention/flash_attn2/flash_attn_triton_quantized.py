@@ -71,8 +71,8 @@ def _fwd_kernel(
     Out,
     Lse,  # b, h, s
     TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
-    K_lut,  # b, elements, e.g. 2 bits, shape is [b, 4]
-    K_lut_elems,  # number of elements per batch in K_lut, e.g. 4
+    K_scales,  # b
+    K_zero_points,  # b
     softmax_scale,
     stride_qb, # batch
     stride_qh, # nheads
@@ -89,7 +89,6 @@ def _fwd_kernel(
     stride_ob,
     stride_oh,
     stride_om,
-    stride_klb,
     nheads,
     seqlen_q,
     seqlen_k,
@@ -135,6 +134,11 @@ def _fwd_kernel(
         V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
     )
 
+    k_scales_ptr = K_scales + off_b
+    k_zero_points_ptr = K_zero_points + off_b
+    k_scales = tl.load(k_scales_ptr)
+    k_zero_points = tl.load(k_zero_points_ptr)
+
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -176,9 +180,12 @@ def _fwd_kernel(
         k_ind = tl.cast((k[:, :, None] >> ((K_RANGE - offs_d_k_range[None, None, :] - 1) * K_BITS)) & ((1 << K_BITS) - 1), tl.uint8)
         k_ind = tl.reshape(k_ind, [BLOCK_N, BLOCK_HEADDIM])
 
+        k_decoded = (k_ind - k_zero_points) / k_scales
+
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # qk += tl.dot(q, tl.trans(k))
-        qk += tl.reshape(tl.sum(q * k_ind, axis=-1), [BLOCK_M, BLOCK_N])
+        qk += tl.reshape(tl.sum(q * k_decoded, axis=-1), [BLOCK_M, BLOCK_N])
+        # qk += tl.reshape(tl.sum(q * k_ind, axis=-1), [BLOCK_M, BLOCK_N])
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
@@ -785,7 +792,7 @@ def _bwd_kernel(
         )
 
 
-def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, bias=None, causal=False, softmax_scale=None):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
     k_range = 2**k_bits
@@ -827,9 +834,6 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
     tmp = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
     o = torch.empty_like(q)
 
-    k_lut_elems = 2**k_bits
-    assert k_lut_elems == k_lut.shape[1], "k_lut_elems must match k_lut shape"
-
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     assert BLOCK_HEADDIM % k_range == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_range(={k_range})"
     BLOCK_M = 1
@@ -844,8 +848,8 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         o,
         lse,
         tmp,
-        k_lut, 
-        k_lut_elems,
+        k_scales, # 1D
+        k_zero_points, # 1D
         softmax_scale,
         q.stride(0), # stride_b
         q.stride(2), # stride_h
@@ -860,7 +864,6 @@ def _flash_attn_forward(q, k, v, k_bits, k_lut, bias=None, causal=False, softmax
         o.stride(0),
         o.stride(2),
         o.stride(1),
-        k_lut.stride(0),
         nheads,
         seqlen_q,
         seqlen_k,
@@ -1105,7 +1108,7 @@ def _flash_attn_backward(
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, k_bits, k_lut, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, q, k, v, k_bits, k_scales, k_zero_points, bias=None, causal=False, softmax_scale=None):
         """
         q: (batch_size, seqlen_q, nheads, headdim)
         k, v: (batch_size, seqlen_k, nheads, headdim)
@@ -1116,7 +1119,7 @@ class FlashAttnFunc(torch.autograd.Function):
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
         o, lse, ctx.softmax_scale = _flash_attn_forward(
-            q, k, v, k_bits, k_lut, bias=bias, causal=causal, softmax_scale=softmax_scale
+            q, k, v, k_bits, k_scales, k_zero_points, bias=bias, causal=causal, softmax_scale=softmax_scale
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
