@@ -1,6 +1,5 @@
 import os
 import argparse
-from tqdm import tqdm
 import torch
 import triton
 
@@ -25,6 +24,48 @@ def get_arguments():
     parser.add_argument("--head_size", type=int, default=48)
     parser.add_argument("--dim", type=int, default=128)
     return parser.parse_args()
+
+
+def encode_torch(x, bits):
+    compression_scale = 8 // bits
+    shp = list(x.shape)
+    assert shp[-1] % compression_scale == 0, f"Last dimension of input tensor must be divisible by {compression_scale}"
+    shp[-1] = shp[-1] // compression_scale
+    
+    x_view = x.view(*shp, compression_scale)
+    x_encoded = torch.zeros(*shp, dtype=torch.uint8, device=x.device)
+    for bit_pos in range(compression_scale):
+        x_encoded |= (x_view[..., bit_pos] & ((1 << bits) - 1)) << ((compression_scale - 1 - bit_pos) * bits)
+    return x_encoded
+
+
+def decode_torch(x, bits, scales, offsets):
+    compression_scale = 8 // bits
+    shp = list(x.shape)
+    x_decoded = torch.zeros(*shp, compression_scale, dtype=torch.uint8, device=x.device)
+
+    for bit_pos in range(compression_scale):
+        x_decoded[..., bit_pos] = (x >> ((compression_scale - 1 - bit_pos) * bits)) & ((1 << bits) - 1)
+
+    x_decoded = x_decoded.view(*shp[:-1], -1)
+    shp_ = [-1] + (len(shp)-1) * [1]
+    v = x_decoded * scales.view(shp_) + offsets.view(shp_)
+    return x_decoded, v
+
+
+def test_encode_decode():
+    # torch.manual_seed(0)
+    x = torch.randint(0, 4, (2, 3, 4), device='cuda', dtype=torch.uint8)
+    scales = torch.randn(2, dtype=torch.float16, device='cuda')
+    offsets = torch.randn(2, dtype=torch.float16, device='cuda')
+
+    shp_ = [-1] + (len(list(x.shape))-1) * [1]
+    v = x * scales.view(shp_) + offsets.view(shp_)
+
+    x_encoded = encode_torch(x, 2)
+    x_decoded, v_decoded = decode_torch(x_encoded, 2, scales, offsets)
+    torch.testing.assert_close(x, x_decoded)
+    torch.testing.assert_close(v, v_decoded)
 
 
 def run_quantization(val, bits = 2):
@@ -161,4 +202,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # test_encode_decode()
     main()
