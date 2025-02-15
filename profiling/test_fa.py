@@ -4,7 +4,7 @@ import torch
 import triton
 
 from attention.flash_attn2.flash_attn_triton_amd import flash_attn_func as flash_attn_func_amd
-from attention.flash_attn2.flash_attn_triton_q import flash_attn_func
+from attention.flash_attn2.flash_attn_triton_quantized import flash_attn_func
 from attention.hyper_attn.hyper_attn import HyperAttention
 from attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
 

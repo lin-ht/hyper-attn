@@ -1135,7 +1135,13 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, None, None, None
 
 
-flash_attn_func = FlashAttnFunc.apply
+flash_attn_func_apply = FlashAttnFunc.apply
+
+
+def flash_attn_func(q, k, v, bias=None, causal=False, softmax_scale=None):
+    k_bits = 2
+    k_lut = torch.zeros(q.shape[0], 2**k_bits, device=q.device, dtype=q.dtype)
+    return flash_attn_func_apply(q, k, v, k_bits, k_lut, bias, causal, softmax_scale)
 
 
 from attention.flash_attn2.quantization import quantize, dequantize, prepare_data, test_quantization2
