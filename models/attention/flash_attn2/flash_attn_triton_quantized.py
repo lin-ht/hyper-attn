@@ -241,9 +241,10 @@ def _fwd_kernel(
         V_BITS_BASE: tl.constexpr = (V_CNTS - 1) * V_BITS
         v_ind = (v[:, :, None] >> (V_BITS_BASE - offs_d_v_cnts[None, None, :]* V_BITS)) & V_BITS_MASK
         v_ind = tl.reshape(v_ind, [BLOCK_N, BLOCK_HEADDIM])
-
         v_decoded = (v_ind - v_zero_points) / v_scales
-        
+        if not EVEN_N:  # Need to mask out otherwise the acc_o is wrong
+            v_decoded *= tl.where((start_n + offs_n)[:, None] < seqlen_k, 1, 0) # [BLOCK_N, BLOCK_HEADDIM]
+
         # p = p.to(v.dtype)
         acc_o += tl.sum(tl.trans(p) * v_decoded, 0) # acc_o += tl.dot(p, v) # v: [BLOCK_N, BLOCK_HEADDIM]
 

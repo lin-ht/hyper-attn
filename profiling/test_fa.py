@@ -358,7 +358,7 @@ def main():
         print(f"{arg_name:<16} : {arg_var}")
 
     # seq_lens = [2**i for i in range(16, 18)]
-    seq_lens = [2777, 3328]
+    seq_lens = [128, 3328]
 
     attn_method = args.attn_method # ['flash', 'hyper']
     attn_impl = args.impl # ['cuda', 'triton', 'xformers']
@@ -381,5 +381,5 @@ def main():
 
 
 if __name__ == "__main__":
-    test_encode_decode()
-    # main()
+    # test_encode_decode()
+    main()
