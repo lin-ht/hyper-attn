@@ -173,7 +173,7 @@ def _fwd_kernel(
             if EVEN_HEADDIM:
                 k = tl.load(k_ptrs + start_n * stride_kn)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0)
+                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d_k[None, :] * K_CNTS < headdim, other=0)
         else:
             if EVEN_HEADDIM:
                 k = tl.load(
@@ -184,7 +184,7 @@ def _fwd_kernel(
             else:
                 k = tl.load(
                     k_ptrs + start_n * stride_kn,
-                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d_k[None, :] * K_CNTS < headdim),
                     other=0,
                 )
         # dequantize k
@@ -221,7 +221,7 @@ def _fwd_kernel(
             if EVEN_HEADDIM:
                 v = tl.load(v_ptrs + start_n * stride_vn)
             else:
-                v = tl.load(v_ptrs + start_n * stride_vn, mask=offs_d[None, :] < headdim, other=0.0)
+                v = tl.load(v_ptrs + start_n * stride_vn, mask=offs_d_v[None, :] * V_CNTS < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
                 v = tl.load(
@@ -232,7 +232,7 @@ def _fwd_kernel(
             else:
                 v = tl.load(
                     v_ptrs + start_n * stride_vn,
-                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d_v[None, :] * V_CNTS < headdim),
                     other=0.0,
                 )
         # dequantize v
