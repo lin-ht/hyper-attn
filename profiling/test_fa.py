@@ -114,10 +114,24 @@ def decode_kernel(
         # tl.device_print("x_ind:", x_ind)
         x_decoded = (x_ind - zero_points_data) / scales_data
         # x_decoded = tl.cast(x_ind, tl.float16)
-        if EVEN_HEADDIM:
-            tl.store(o_ptrs + start_n * stride_os, x_decoded.to(tl.float16))
+        if EVEN_N:
+            if EVEN_HEADDIM:
+                tl.store(o_ptrs + start_n * stride_os, x_decoded.to(tl.float16))
+            else:
+                tl.store(o_ptrs + start_n * stride_os, x_decoded.to(tl.float16), mask=offs_d_o[None, :] < headdim)
         else:
-            tl.store(o_ptrs + start_n * stride_os, x_decoded.to(tl.float16), mask=offs_d_o[None, :] < headdim)
+            if EVEN_HEADDIM:
+                tl.store(
+                    o_ptrs + start_n * stride_os,
+                    x_decoded.to(tl.float16),
+                    mask=(start_n + offs_s)[:, None] < seqlen,
+                )
+            else:
+                tl.store(
+                    o_ptrs + start_n * stride_os,
+                    x_decoded.to(tl.float16),
+                    mask=((start_n + offs_s)[:, None] < seqlen) & (offs_d_o[None, :] < headdim),
+                )
 
 
 def decode_triton(x, bits, scales, zero_points):
@@ -194,9 +208,9 @@ def check_diff(rst, rst_expected):
 
 def test_encode_decode():
     torch.manual_seed(0)
-    # batch_size,seq_len, head_size, headdim = 100, 3201, 48, 128
-    # batch_size,seq_len, head_size, headdim = 100, 128, 48, 32
-    batch_size,seq_len, head_size, headdim = 79, 128*26, 48, 128
+    batch_size,seq_len, head_size, headdim = 100, 3201, 48, 128
+    # batch_size,seq_len, head_size, headdim = 2, 128, 4, 32
+    # batch_size,seq_len, head_size, headdim = 120, 127*3, 48, 128
     bits = 2
     p0 = 1
 
