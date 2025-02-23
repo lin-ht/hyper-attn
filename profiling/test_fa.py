@@ -203,7 +203,10 @@ def check_diff(rst, rst_expected, verbose=True):
     is_allclose = torch.allclose(rst, rst_expected)
     max_err = (rst - rst_expected).abs().max()
     mean_err = (rst - rst_expected).abs().mean()
+    max_err_pos = (rst - rst_expected).abs().argmax()
+    max_err_pos = torch.unravel_index(max_err_pos, rst.shape)
     if verbose:
+        print(f"Position of maximum error: {max_err_pos}")
         print(f"Maximum error: {max_err}, Mean error: {mean_err}, Allclose: {is_allclose}")
     return is_allclose, max_err, mean_err
 
@@ -250,7 +253,7 @@ def run_quantization(val, bits = 2):
     val_max = val_view.max(dim=-1).values.unsqueeze_(-1)
 
     quant_levels = 2**bits - 1
-    scale = quant_levels / (val_max - val_min)
+    scale = quant_levels / (val_max - val_min).to(torch.float32)
     zero_point = -val_min * scale
 
     ind = torch.round(torch.clamp(val_view * scale + zero_point, 0, quant_levels)).to(torch.uint8)
@@ -292,6 +295,7 @@ def do_bench(fn, warmup, rep, mode:str='fwd'):
 
 
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
+    torch.manual_seed(0)
     q, k, v = get_tensors(batch_size, seq_len, head_size, dim)
     k_bits = 1
     v_bits = 2
@@ -313,7 +317,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
                 # rst = flash_attn_func(q, k, v, None, causal, None)[0]
                 print("flash attn output shape:", rst.shape)
 
-                check_diff(deb[:,0:seq_len,:,:], k_ind.to(deb.dtype))
+                check_diff(deb[:,0:seq_len,:,:], k.to(deb.dtype))
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
 

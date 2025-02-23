@@ -149,13 +149,13 @@ def _fwd_kernel(
 
     k_scales_ptr = K_scales + off_b
     k_zero_points_ptr = K_zero_points + off_b
-    k_scales = tl.load(k_scales_ptr)
-    k_zero_points = tl.load(k_zero_points_ptr)
+    k_scales_data = tl.load(k_scales_ptr)
+    k_zero_points_data = tl.load(k_zero_points_ptr)
 
     v_scales_ptr = V_scales + off_b
     v_zero_points_ptr = V_zero_points + off_b
-    v_scales = tl.load(v_scales_ptr)
-    v_zero_points = tl.load(v_zero_points_ptr)
+    v_scales_data = tl.load(v_scales_ptr)
+    v_zero_points_data = tl.load(v_zero_points_ptr)
 
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
@@ -200,10 +200,8 @@ def _fwd_kernel(
         K_BITS_BASE: tl.constexpr = (K_CNTS - 1) * K_BITS
         k_ind = (k[:, :, None] >> (K_BITS_BASE - offs_d_k_cnts[None, None, :]* K_BITS)) & K_BITS_MASK
         k_ind = tl.reshape(k_ind, [BLOCK_N, BLOCK_HEADDIM])
-
-        k_decoded = (k_ind - k_zero_points) / k_scales
-
-        deb_data = k_ind + 0.0
+        k_decoded = (k_ind - k_zero_points_data) / k_scales_data
+        deb_data = k_decoded
         if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
                 tl.store(deb_ptrs + start_n * stride_debn, deb_data)
@@ -268,7 +266,7 @@ def _fwd_kernel(
         V_BITS_BASE: tl.constexpr = (V_CNTS - 1) * V_BITS
         v_ind = (v[:, :, None] >> (V_BITS_BASE - offs_d_v_cnts[None, None, :]* V_BITS)) & V_BITS_MASK
         v_ind = tl.reshape(v_ind, [BLOCK_N, BLOCK_HEADDIM])
-        v_decoded = (v_ind - v_zero_points) / v_scales
+        v_decoded = (v_ind - v_zero_points_data) / v_scales_data
         if not EVEN_N:  # Need to mask out otherwise the acc_o is wrong
             v_decoded *= tl.where((start_n + offs_n)[:, None] < seqlen_k, 1, 0) # [BLOCK_N, BLOCK_HEADDIM]
 
@@ -908,7 +906,7 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
     tmp = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
     
     o = torch.empty_like(q)
-    deb = torch.empty((batch, math.ceil(seqlen_k/128) * 128, nheads, d), device=k.device, dtype=torch.float32)
+    deb = torch.empty((batch, math.ceil(seqlen_k/128) * 128, nheads, d), device=k.device, dtype=q.dtype)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     assert BLOCK_HEADDIM % k_cnts == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_cnts(={k_cnts})"
@@ -1201,7 +1199,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k)
         """
         # Make sure that the last dimension is contiguous
-        q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
+        q, k, v, k_scales, k_zero_points, v_scales, v_zero_points = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v, k_scales, k_zero_points, v_scales, v_zero_points]]
         o, lse, ctx.softmax_scale, deb = _flash_attn_forward(
             q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, bias=bias, causal=causal, softmax_scale=softmax_scale
         )
