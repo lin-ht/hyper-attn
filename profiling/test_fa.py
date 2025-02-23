@@ -199,10 +199,12 @@ def decode_torch(x, bits, scales, zero_points):
     return x_decoded, v
 
 
-def check_diff(rst, rst_expected):
+def check_diff(rst, rst_expected, verbose=True):
     is_allclose = torch.allclose(rst, rst_expected)
     max_err = (rst - rst_expected).abs().max()
     mean_err = (rst - rst_expected).abs().mean()
+    if verbose:
+        print(f"Maximum error: {max_err}, Mean error: {mean_err}, Allclose: {is_allclose}")
     return is_allclose, max_err, mean_err
 
 
@@ -232,7 +234,6 @@ def test_encode_decode():
     o_decoded = decode_triton(x_encoded, bits, scales, zero_points)
     print(f"{o_decoded.shape=},\n{o_decoded[p0, 0, 0, :]=}")
     is_allclose, max_err, mean_err = check_diff(v, o_decoded)
-    print(f"Maximum error: {max_err}, Mean error: {mean_err}, Allclose: {is_allclose}")
     # torch.testing.assert_close(x, o_decoded.to(torch.uint8))
     torch.testing.assert_close(v, o_decoded)
     print("Passed!")
@@ -308,9 +309,11 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
         
             if impl == "triton":
-                rst = flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
+                rst, _, deb = flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
                 # rst = flash_attn_func(q, k, v, None, causal, None)[0]
                 print("flash attn output shape:", rst.shape)
+
+                check_diff(deb[:,0:seq_len,:,:], v)
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
 
@@ -336,7 +339,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
 
 
 def run_hyper_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
-    q, k, v = get_tensors(batch_size, head_size, seq_len, dim)[:3]
+    q, k, v = get_tensors(batch_size, seq_len, head_size, dim)[:3]
     block_size = 256
     sample_size = 256
 

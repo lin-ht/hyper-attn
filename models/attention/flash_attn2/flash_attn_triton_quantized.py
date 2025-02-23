@@ -71,6 +71,7 @@ def _fwd_kernel(
     Out,
     Lse,  # b, h, s
     TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
+    deb,
     K_scales,  # b
     K_zero_points,  # b
     V_scales,  # b
@@ -91,6 +92,9 @@ def _fwd_kernel(
     stride_ob,
     stride_oh,
     stride_om,
+    stride_debb,
+    stride_debh,
+    stride_debn,
     nheads,
     seqlen_q,
     seqlen_k,
@@ -138,6 +142,9 @@ def _fwd_kernel(
     ) # [BLOCK_N, BLOCK_HEADDIM]
     v_ptrs = (
         V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d_v[None, :])
+    )
+    deb_ptrs = (
+        deb + off_b * stride_debb + off_h * stride_debh + (offs_n[:, None] * stride_debn + offs_d[None, :])
     )
 
     k_scales_ptr = K_scales + off_b
@@ -252,6 +259,25 @@ def _fwd_kernel(
         m_i = m_ij
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
+
+        if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
+            if EVEN_HEADDIM:
+                tl.store(deb_ptrs + start_n * stride_debn, v_decoded)
+            else:
+                tl.store(deb_ptrs + start_n * stride_debn, v_decoded, mask=offs_d[None, :] < headdim)
+        else:
+            if EVEN_HEADDIM:
+                tl.store(
+                    deb_ptrs + start_n * stride_debn,
+                    v_decoded,
+                    mask=(start_n + offs_n)[:, None] < seqlen_k,
+                )
+            else:
+                tl.store(
+                    deb_ptrs + start_n * stride_debn,
+                    v_decoded,
+                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :]< headdim),
+                )
     # end of for start_n in range(0, end_n, BLOCK_N):
 
     o_scale = tl.exp(m_i - lse_i)
@@ -860,7 +886,9 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
     seqlen_q_rounded = seqlen_q # math.ceil(seqlen_q / 128) * 128
     lse = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
     tmp = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
+    
     o = torch.empty_like(q)
+    deb = torch.empty((batch, math.ceil(seqlen_k/128) * 128, nheads, d), device=k.device, dtype=q.dtype)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     assert BLOCK_HEADDIM % k_cnts == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_cnts(={k_cnts})"
@@ -876,6 +904,7 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
         o,
         lse,
         tmp,
+        deb,
         k_scales, # 1D
         k_zero_points, # 1D
         v_scales, # 1D
@@ -894,6 +923,9 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
         o.stride(0),
         o.stride(2),
         o.stride(1),
+        deb.stride(0),
+        deb.stride(2),
+        deb.stride(1),
         nheads,
         seqlen_q,
         seqlen_k,
@@ -915,7 +947,7 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
         num_warps=num_warps,
         num_stages=1,
     )
-    return o, lse, softmax_scale  # softmax_scale could have been updated
+    return o, lse, softmax_scale, deb  # softmax_scale could have been updated
 
 
 def _flash_attn_backward(
@@ -1150,12 +1182,12 @@ class FlashAttnFunc(torch.autograd.Function):
         """
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
-        o, lse, ctx.softmax_scale = _flash_attn_forward(
+        o, lse, ctx.softmax_scale, deb = _flash_attn_forward(
             q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, bias=bias, causal=causal, softmax_scale=softmax_scale
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
-        return o, lse
+        return o, lse, deb
 
     @staticmethod
     def backward(ctx, do, dlse_use_needed=None):
