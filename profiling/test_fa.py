@@ -313,7 +313,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
                 # rst = flash_attn_func(q, k, v, None, causal, None)[0]
                 print("flash attn output shape:", rst.shape)
 
-                check_diff(deb[:,0:seq_len,:,:], v)
+                check_diff(deb[:,0:seq_len,:,:], k_ind.to(deb.dtype))
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
 

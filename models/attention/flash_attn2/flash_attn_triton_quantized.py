@@ -203,6 +203,26 @@ def _fwd_kernel(
 
         k_decoded = (k_ind - k_zero_points) / k_scales
 
+        deb_data = k_ind + 0.0
+        if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
+            if EVEN_HEADDIM:
+                tl.store(deb_ptrs + start_n * stride_debn, deb_data)
+            else:
+                tl.store(deb_ptrs + start_n * stride_debn, deb_data, mask=offs_d[None, :] < headdim)
+        else:
+            if EVEN_HEADDIM:
+                tl.store(
+                    deb_ptrs + start_n * stride_debn,
+                    deb_data,
+                    mask=(start_n + offs_n)[:, None] < seqlen_k,
+                )
+            else:
+                tl.store(
+                    deb_ptrs + start_n * stride_debn,
+                    deb_data,
+                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :]< headdim),
+                )
+
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # qk += tl.dot(q, tl.trans(k))
         qk += tl.reshape(tl.sum(q * k_decoded, axis=-1), [BLOCK_M, BLOCK_N])
@@ -260,24 +280,24 @@ def _fwd_kernel(
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
 
-        if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
-            if EVEN_HEADDIM:
-                tl.store(deb_ptrs + start_n * stride_debn, v_decoded)
-            else:
-                tl.store(deb_ptrs + start_n * stride_debn, v_decoded, mask=offs_d[None, :] < headdim)
-        else:
-            if EVEN_HEADDIM:
-                tl.store(
-                    deb_ptrs + start_n * stride_debn,
-                    v_decoded,
-                    mask=(start_n + offs_n)[:, None] < seqlen_k,
-                )
-            else:
-                tl.store(
-                    deb_ptrs + start_n * stride_debn,
-                    v_decoded,
-                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :]< headdim),
-                )
+        # if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
+        #     if EVEN_HEADDIM:
+        #         tl.store(deb_ptrs + start_n * stride_debn, v_decoded)
+        #     else:
+        #         tl.store(deb_ptrs + start_n * stride_debn, v_decoded, mask=offs_d[None, :] < headdim)
+        # else:
+        #     if EVEN_HEADDIM:
+        #         tl.store(
+        #             deb_ptrs + start_n * stride_debn,
+        #             v_decoded,
+        #             mask=(start_n + offs_n)[:, None] < seqlen_k,
+        #         )
+        #     else:
+        #         tl.store(
+        #             deb_ptrs + start_n * stride_debn,
+        #             v_decoded,
+        #             mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :]< headdim),
+        #         )
     # end of for start_n in range(0, end_n, BLOCK_N):
 
     o_scale = tl.exp(m_i - lse_i)
@@ -888,7 +908,7 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
     tmp = torch.empty((batch, nheads, seqlen_q_rounded * 128), device=q.device, dtype=torch.float32)
     
     o = torch.empty_like(q)
-    deb = torch.empty((batch, math.ceil(seqlen_k/128) * 128, nheads, d), device=k.device, dtype=q.dtype)
+    deb = torch.empty((batch, math.ceil(seqlen_k/128) * 128, nheads, d), device=k.device, dtype=torch.float32)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     assert BLOCK_HEADDIM % k_cnts == 0, f"BLOCK_HEADDIM(={BLOCK_HEADDIM}) must be divisible by k_cnts(={k_cnts})"
