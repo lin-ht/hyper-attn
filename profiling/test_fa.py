@@ -295,7 +295,7 @@ def do_bench(fn, warmup, rep, mode:str='fwd'):
 
 
 def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="triton", warmup=20, rep=100):
-    torch.manual_seed(0)
+    # torch.manual_seed(0)
     q, k, v = get_tensors(batch_size, seq_len, head_size, dim)
     k_bits = 1
     v_bits = 2
@@ -313,11 +313,14 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
         
             if impl == "triton":
-                rst, _, deb = flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
+                # # No encoding:
+                rst, _, deb = flash_attn_func(q, k, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
+                # # Encoded:
+                # rst, _, deb = flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
                 # rst = flash_attn_func(q, k, v, None, causal, None)[0]
                 print("flash attn output shape:", rst.shape)
 
-                check_diff(deb[:,0:seq_len,:,:], k.to(deb.dtype))
+                # check_diff(deb[:,0:seq_len,:,:], k.to(deb.dtype))
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
 
@@ -333,7 +336,10 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             raise ImportError("Please install flash_attn (pip install flash-attn --no-build-isolation)")
         fn = lambda: flash_attn_func_cuda(q, k, v, causal=causal)
     elif impl == "triton":
-        fn = lambda: flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
+        # # No encoding:
+        fn = lambda: flash_attn_func(q, k, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
+        # # Encoded:
+        # fn = lambda: flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
     elif impl == "amd":
         fn = lambda: flash_attn_func_amd(q, k, v, causal)[0]
     else:  # impl == "xformers"

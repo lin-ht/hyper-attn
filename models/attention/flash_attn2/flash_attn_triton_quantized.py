@@ -137,8 +137,13 @@ def _fwd_kernel(
     q_ptrs = (
         Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
     ) # [1, BLOCK_HEADDIM]
+    # # Encoded:
+    # k_ptrs = (
+    #     K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d_k[None, :])
+    # ) # [BLOCK_N, BLOCK_HEADDIM]
+    # No encoding:
     k_ptrs = (
-        K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d_k[None, :])
+        K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
     ) # [BLOCK_N, BLOCK_HEADDIM]
     v_ptrs = (
         V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d_v[None, :])
@@ -147,10 +152,11 @@ def _fwd_kernel(
         deb + off_b * stride_debb + off_h * stride_debh + (offs_n[:, None] * stride_debn + offs_d[None, :])
     )
 
-    k_scales_ptr = K_scales + off_b
-    k_zero_points_ptr = K_zero_points + off_b
-    k_scales_data = tl.load(k_scales_ptr)
-    k_zero_points_data = tl.load(k_zero_points_ptr)
+    # # Encoded:
+    # k_scales_ptr = K_scales + off_b
+    # k_zero_points_ptr = K_zero_points + off_b
+    # k_scales_data = tl.load(k_scales_ptr)
+    # k_zero_points_data = tl.load(k_zero_points_ptr)
 
     v_scales_ptr = V_scales + off_b
     v_zero_points_ptr = V_zero_points + off_b
@@ -180,7 +186,10 @@ def _fwd_kernel(
             if EVEN_HEADDIM:
                 k = tl.load(k_ptrs + start_n * stride_kn)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d_k[None, :] * K_CNTS < headdim, other=0)
+                # # No encoding:
+                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0)
+                # # Encoded:
+                # k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d_k[None, :] * K_CNTS < headdim, other=0)
         else:
             if EVEN_HEADDIM:
                 k = tl.load(
@@ -189,41 +198,52 @@ def _fwd_kernel(
                     other=0,
                 )
             else:
+                # # No Encoding:
                 k = tl.load(
                     k_ptrs + start_n * stride_kn,
-                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d_k[None, :] * K_CNTS < headdim),
+                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                     other=0,
                 )
+                # # Encoded:
+                # k = tl.load(
+                #     k_ptrs + start_n * stride_kn,
+                #     mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d_k[None, :] * K_CNTS < headdim),
+                #     other=0,
+                # )
+        # # Encoded:
         # dequantize k
-        tl.debug_barrier()
-        K_BITS_MASK: tl.constexpr = ((1 << K_BITS) - 1)
-        K_BITS_BASE: tl.constexpr = (K_CNTS - 1) * K_BITS
-        k_ind = (k[:, :, None] >> (K_BITS_BASE - offs_d_k_cnts[None, None, :]* K_BITS)) & K_BITS_MASK
-        k_ind = tl.reshape(k_ind, [BLOCK_N, BLOCK_HEADDIM])
-        k_decoded = (k_ind - k_zero_points_data) / k_scales_data
-        deb_data = k_decoded
-        if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
-            if EVEN_HEADDIM:
-                tl.store(deb_ptrs + start_n * stride_debn, deb_data)
-            else:
-                tl.store(deb_ptrs + start_n * stride_debn, deb_data, mask=offs_d[None, :] < headdim)
-        else:
-            if EVEN_HEADDIM:
-                tl.store(
-                    deb_ptrs + start_n * stride_debn,
-                    deb_data,
-                    mask=(start_n + offs_n)[:, None] < seqlen_k,
-                )
-            else:
-                tl.store(
-                    deb_ptrs + start_n * stride_debn,
-                    deb_data,
-                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :]< headdim),
-                )
+        # tl.debug_barrier()
+        # K_BITS_MASK: tl.constexpr = ((1 << K_BITS) - 1)
+        # K_BITS_BASE: tl.constexpr = (K_CNTS - 1) * K_BITS
+        # k_ind = (k[:, :, None] >> (K_BITS_BASE - offs_d_k_cnts[None, None, :]* K_BITS)) & K_BITS_MASK
+        # k_ind = tl.reshape(k_ind, [BLOCK_N, BLOCK_HEADDIM])
+        # k_decoded = (k_ind - k_zero_points_data) / k_scales_data
+        # deb_data = k_decoded
+        # if EVEN_N:  # If we just do "if EVEN_N", there seems to be some race condition
+        #     if EVEN_HEADDIM:
+        #         tl.store(deb_ptrs + start_n * stride_debn, deb_data)
+        #     else:
+        #         tl.store(deb_ptrs + start_n * stride_debn, deb_data, mask=offs_d[None, :] < headdim)
+        # else:
+        #     if EVEN_HEADDIM:
+        #         tl.store(
+        #             deb_ptrs + start_n * stride_debn,
+        #             deb_data,
+        #             mask=(start_n + offs_n)[:, None] < seqlen_k,
+        #         )
+        #     else:
+        #         tl.store(
+        #             deb_ptrs + start_n * stride_debn,
+        #             deb_data,
+        #             mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :]< headdim),
+        #         )
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # qk += tl.dot(q, tl.trans(k))
-        qk += tl.reshape(tl.sum(q * k_decoded, axis=-1), [BLOCK_M, BLOCK_N])
+        # # No encoding:
+        qk += tl.reshape(tl.sum(q * k, axis=-1), [BLOCK_M, BLOCK_N])
+        # # Encoded:
+        # qk += tl.reshape(tl.sum(q * k_decoded, axis=-1), [BLOCK_M, BLOCK_N])
         # qk += tl.reshape(tl.sum(q * k_ind, axis=-1), [BLOCK_M, BLOCK_N])
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
@@ -870,13 +890,18 @@ def _flash_attn_forward(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scal
     
     _, seqlen_k, _, d_k = k.shape
     _, seqlen_v, _, d_v = v.shape
-    assert d == d_k * k_cnts, f"d(={d}) must be d_k(={d_k}) * k_cnts(={k_cnts})"
+    # # No encoding:
+    assert d == d_k, f"d(={d}) must be d_k(={d_k})"
+    # # Encoded:
+    # assert d == d_k * k_cnts, f"d(={d}) must be d_k(={d_k}) * k_cnts(={k_cnts})"
     assert d == d_v * v_cnts, f"d(={d}) must be d_v(={d_v}) * v_cnts(={v_cnts})"
     assert k.shape == (batch, seqlen_k, nheads, d_k)
     assert v.shape == (batch, seqlen_k, nheads, d_v)
     assert d <= 128, "FlashAttention only support head dimensions up to 128"
     # assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
-    assert k.dtype in [torch.uint8], "k encoded type must be uint8"
+    assert q.dtype == k.dtype, "Tensor q and k must have the same type"
+    # # Encoded:
+    # assert k.dtype in [torch.uint8], "k encoded type must be uint8"
     assert v.dtype in [torch.uint8], "v encoded type must be uint8"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
