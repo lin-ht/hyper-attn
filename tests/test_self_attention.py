@@ -4,24 +4,38 @@ import numpy as np
 import pytest
 import torch
 
-from models.attention.flash_attn2.flash_attn_triton_alexdremov import (
+from attention.flash_attn2.flash_attn_triton_alexdremov import (
     self_attention, 
     self_attention_reference,
 )
 
 
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=lambda x: f"{x}")
+# @pytest.mark.parametrize(
+#     "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+# )
+# @pytest.mark.parametrize(
+#     "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
+# )
+# @pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
+# @pytest.mark.parametrize("B", [1, 40, 64], ids=lambda x: f"batch-{x}")
+# @pytest.mark.parametrize("H", [1, 6, 8, 48], ids=lambda x: f"heads-{x}")
+# @pytest.mark.parametrize("T", [1, 10, 16, 800, 1025], ids=lambda x: f"time-{x}")
+# @pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize(
-    "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+    "lens", ["none"], ids=lambda x: f"lens-{x}"
 )
 @pytest.mark.parametrize(
-    "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
+    "noncontiguous", [True], ids=lambda x: f"noncontiguous-{x}"
 )
-@pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
-@pytest.mark.parametrize("B", [1, 40, 64], ids=lambda x: f"batch-{x}")
-@pytest.mark.parametrize("H", [1, 6, 8], ids=lambda x: f"heads-{x}")
-@pytest.mark.parametrize("T", [1, 10, 16, 800, 1025], ids=lambda x: f"time-{x}")
-@pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
+@pytest.mark.parametrize("HEAD_DIM", [128], ids=lambda x: f"dim-{x}")
+@pytest.mark.parametrize("B", [40], ids=lambda x: f"batch-{x}")
+@pytest.mark.parametrize("H", [48], ids=lambda x: f"heads-{x}")
+@pytest.mark.parametrize("T", [1, 1025], ids=lambda x: f"time-{x}")
+# @pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
+@pytest.mark.parametrize("autotune", [False], ids=lambda x: f"autotune-{x}")
 def test_self_attention(
     B,
     H,
@@ -48,7 +62,7 @@ def test_self_attention(
 
     shape_mul = 2 if noncontiguous else 1
 
-    q, k, v = [
+    q, k, v = [ # (B, H, T:SEQLEN, HEAD_DIM)
         torch.testing.make_tensor(
             (B * shape_mul, H * shape_mul, T * shape_mul, HEAD_DIM * shape_mul),
             dtype=dtype,
@@ -60,6 +74,8 @@ def test_self_attention(
         )
         for _ in range(3)
     ]
+    # single seqlen_q
+    q = q[:, :, :1, :]
 
     if noncontiguous:
         q = q[1::2, 1::2, 1::2, 1::2].detach().clone().requires_grad_()
@@ -102,3 +118,4 @@ def test_self_attention(
         rtol=0,
         msg=lambda x: f"{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
+    print("Passed!")

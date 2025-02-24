@@ -123,13 +123,13 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 )
 @triton.jit
 def _self_attn_fwd(
-    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
+    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, # L is a list of batch sequence lengths
     O: tl.tensor,  #
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
-    lens_stride: int,
+    lens_stride: int, # lens L is a 1D vector or None
     T: int,  #
     PRESCALE: tl.constexpr,  #
     TIME_BUCKET:  int,  #
@@ -234,9 +234,12 @@ def _self_attn_fwd(
                     tl.advance(v_tile_ptr, (kv_token_idx, 0)),
                 )
 
-        qk = tl.dot(
-            q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
-        )
+        if TILE_Q_SIZE == 1:
+            qk = tl.reshape(tl.sum(q_tile * tl.trans(kt_tile), axis=-1), [TILE_Q_SIZE, TILE_K_SIZE])
+        else:
+            qk = tl.dot(
+                q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
+            )
 
         if not PRESCALE:
             qk *= softmax_scale
@@ -250,14 +253,14 @@ def _self_attn_fwd(
 
             qk = tl.where(mask, qk, tl.cast(-float("inf"), qk.dtype))
 
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        p = tl.math.exp2(qk - m_ij[:, None])
+        m_ij = tl.maximum(m_i, tl.max(qk, 1)) # (TILE_Q_SIZE,)
+        p = tl.math.exp2(qk - m_ij[:, None]) # (TILE_Q_SIZE, TILE_K_SIZE)
 
         l_ij = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - m_ij)
 
         l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
+        acc = acc * alpha[:, None] # (TILE_Q_SIZE, HEAD_DIM)
 
         if not V_PRELOAD:
             if last_iter:
@@ -268,14 +271,17 @@ def _self_attn_fwd(
             else:
                 v_tile = tl.load(
                     tl.advance(v_tile_ptr, (kv_token_idx, 0)),
-                )
-        acc = tl.dot(
-            p.to(v_tile.dtype),
-            v_tile,
-            acc,
-            input_precision=INPUT_PRECISION,
-            out_dtype=tl.float32,
-        )
+                ) # (TILE_K_SIZE, HEAD_DIM)
+        if TILE_Q_SIZE == 1:
+            acc += tl.sum(p[:, :, None].to(v_tile.dtype) * v_tile[None, :, :], axis=1) # (TILE_Q_SIZE, HEAD_DIM)
+        else:
+            acc = tl.dot(
+                p.to(v_tile.dtype),
+                v_tile,
+                acc,
+                input_precision=INPUT_PRECISION,
+                out_dtype=tl.float32,
+            )
         m_i = m_ij
 
     acc = acc / l_i[:, None]
@@ -312,13 +318,22 @@ def autotune_posthook(kwargs, exception=None):
         kwargs["L"].add_(-kwargs["q"].size(2))  # L -= time
 
 
+# streaming_forward = triton.heuristics(
+#     dict(
+#         PIPELINING=lambda _: 1,
+#         TILE_Q_SIZE=lambda _: 64,
+#         TILE_K_SIZE=lambda _: 64,
+#     )
+# )(_self_attn_fwd)
+
 streaming_forward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
-        TILE_Q_SIZE=lambda _: 64,
+        TILE_Q_SIZE=lambda _: 1,
         TILE_K_SIZE=lambda _: 64,
     )
 )(_self_attn_fwd)
+
 streaming_forward_autotune = triton.autotune(
     configs=[
         triton.Config(
@@ -372,7 +387,8 @@ def attention_forward_adapter(
 
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
-    assert T == k.shape[-2] and T == v.shape[-2]
+    assert k.shape[-2] == v.shape[-2]
+    # assert T == k.shape[-2] and T == v.shape[-2]
     assert sm_scale is not None
     assert lens is None or (
         lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1
@@ -443,7 +459,7 @@ def self_attention_reference(q, k, v, lens):
         res_mask = torch.tensor([True], device="cuda")
 
     return (
-        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask)
+        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) # (B, H, T:SEQLEN, HEAD_DIM)
         * res_mask,
         res_mask,
     )
