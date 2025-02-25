@@ -123,14 +123,15 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 )
 @triton.jit
 def _self_attn_fwd(
-    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
+    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, # L is a list of batch sequence lengths
     O: tl.tensor,  #
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
-    lens_stride: int,
-    T: int,  #
+    lens_stride: int, # lens L is a 1D vector or None
+    Tq: int,  #
+    Tk: int,  #
     PRESCALE: tl.constexpr,  #
     TIME_BUCKET:  int,  #
     LEN_PRESENT: tl.constexpr,  #
@@ -151,10 +152,10 @@ def _self_attn_fwd(
 
     if LEN_PRESENT:
         seq_len = tl.load(L + batch * lens_stride)
-        seq_len = min(seq_len, T)
+        seq_len = min(seq_len, Tq)
         need_q_mask = q_token_idx + TILE_Q_SIZE >= seq_len
     else:
-        seq_len = T
+        seq_len = Tq
         need_q_mask = False
 
     if seq_len <= q_token_idx:
@@ -163,7 +164,7 @@ def _self_attn_fwd(
     qbatch_head_offset = batch * stride_qb + head * stride_qh
     q_tile_ptr = tl.make_block_ptr(
         base=Q + qbatch_head_offset,
-        shape=(T, HEAD_DIM),
+        shape=(Tq, HEAD_DIM),
         strides=(stride_qt, stride_qk),
         offsets=(q_token_idx, 0),
         block_shape=(TILE_Q_SIZE, HEAD_DIM),
@@ -173,7 +174,7 @@ def _self_attn_fwd(
     kbatch_head_offset = batch * stride_kb + head * stride_kh
     kt_tile_ptr = tl.make_block_ptr(
         base=Kt + kbatch_head_offset,
-        shape=(HEAD_DIM, T),
+        shape=(HEAD_DIM, Tk),
         strides=(stride_kk, stride_kt),
         offsets=(0, 0),
         block_shape=(HEAD_DIM, TILE_K_SIZE),
@@ -183,7 +184,7 @@ def _self_attn_fwd(
     vbatch_head_offset = batch * stride_vb + head * stride_vh
     v_tile_ptr = tl.make_block_ptr(
         base=V + vbatch_head_offset,
-        shape=(T, HEAD_DIM),
+        shape=(Tk, HEAD_DIM),
         strides=(stride_vt, stride_vk),
         offsets=(0, 0),
         block_shape=(TILE_K_SIZE, HEAD_DIM),
@@ -207,7 +208,7 @@ def _self_attn_fwd(
     if PRESCALE:
         q_tile *= softmax_scale
 
-    max_tile = tl.cdiv(seq_len, TILE_K_SIZE)
+    max_tile = tl.cdiv(Tk, TILE_K_SIZE)
     for kv_tile_idx in tl.range(
         0, max_tile, num_stages=PIPELINING
     ):
@@ -234,9 +235,12 @@ def _self_attn_fwd(
                     tl.advance(v_tile_ptr, (kv_token_idx, 0)),
                 )
 
-        qk = tl.dot(
-            q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
-        )
+        if TILE_Q_SIZE == 1:
+            qk = tl.reshape(tl.sum(q_tile * tl.trans(kt_tile), axis=-1), [TILE_Q_SIZE, TILE_K_SIZE])
+        else:
+            qk = tl.dot(
+                q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
+            )
 
         if not PRESCALE:
             qk *= softmax_scale
@@ -245,19 +249,19 @@ def _self_attn_fwd(
             kv_indices = kv_token_idx + tile_k_arange
 
             mask = (
-                kv_indices[None, :] < seq_len
+                kv_indices[None, :] < Tk
             )
 
             qk = tl.where(mask, qk, tl.cast(-float("inf"), qk.dtype))
 
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        p = tl.math.exp2(qk - m_ij[:, None])
+        m_ij = tl.maximum(m_i, tl.max(qk, 1)) # (TILE_Q_SIZE,)
+        p = tl.math.exp2(qk - m_ij[:, None]) # (TILE_Q_SIZE, TILE_K_SIZE)
 
         l_ij = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - m_ij)
 
         l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
+        acc = acc * alpha[:, None] # (TILE_Q_SIZE, HEAD_DIM)
 
         if not V_PRELOAD:
             if last_iter:
@@ -268,14 +272,17 @@ def _self_attn_fwd(
             else:
                 v_tile = tl.load(
                     tl.advance(v_tile_ptr, (kv_token_idx, 0)),
-                )
-        acc = tl.dot(
-            p.to(v_tile.dtype),
-            v_tile,
-            acc,
-            input_precision=INPUT_PRECISION,
-            out_dtype=tl.float32,
-        )
+                ) # (TILE_K_SIZE, HEAD_DIM)
+        if TILE_Q_SIZE == 1:
+            acc += tl.sum(p[:, :, None].to(v_tile.dtype) * v_tile[None, :, :], axis=1) # (TILE_Q_SIZE, HEAD_DIM)
+        else:
+            acc = tl.dot(
+                p.to(v_tile.dtype),
+                v_tile,
+                acc,
+                input_precision=INPUT_PRECISION,
+                out_dtype=tl.float32,
+            )
         m_i = m_ij
 
     acc = acc / l_i[:, None]
@@ -288,7 +295,7 @@ def _self_attn_fwd(
     obatch_head_offset = batch * stride_ob + head * stride_oh
     o_tile_ptr = tl.make_block_ptr(
         base=O + obatch_head_offset,
-        shape=(T, HEAD_DIM),
+        shape=(Tq, HEAD_DIM),
         strides=(stride_ot, stride_ok),
         offsets=(q_token_idx, 0),
         block_shape=(TILE_Q_SIZE, HEAD_DIM),
@@ -314,11 +321,12 @@ def autotune_posthook(kwargs, exception=None):
 
 streaming_forward = triton.heuristics(
     dict(
-        PIPELINING=lambda _: 1,
-        TILE_Q_SIZE=lambda _: 64,
+        PIPELINING=lambda _: 1, # TODO: Tune PIPELINING? lambda args: min(args["Tk"], 4) if args["Tq"] == 1 else 1,
+        # TILE_Q_SIZE=lambda args: min(args["Tq"], 64),
         TILE_K_SIZE=lambda _: 64,
     )
 )(_self_attn_fwd)
+
 streaming_forward_autotune = triton.autotune(
     configs=[
         triton.Config(
@@ -368,11 +376,13 @@ def attention_forward_adapter(
     autotune: bool,
     prescale: bool,
 ) -> torch.Tensor:
-    batch, heads, T, HEAD_DIM = q.shape
+    batch, heads, Tq, HEAD_DIM = q.shape
+    Tk = k.shape[-2]
 
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
-    assert T == k.shape[-2] and T == v.shape[-2]
+    assert Tk == v.shape[-2]
+    # assert Tq == k.shape[-2] and Tq == v.shape[-2]
     assert sm_scale is not None
     assert lens is None or (
         lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1
@@ -386,8 +396,10 @@ def attention_forward_adapter(
     grid = lambda args: (
         batch,
         heads,
-        triton.cdiv(T, args["TILE_Q_SIZE"]),
+        triton.cdiv(Tq, args["TILE_Q_SIZE"]),
     )
+    tile_q = min(64, Tq)
+    print(f"tile_q: {tile_q}")
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
     fwd_fn = streaming_forward_autotune if autotune else streaming_forward
@@ -402,12 +414,14 @@ def attention_forward_adapter(
         *strides(v),
         *strides(O),
         *(strides(lens) if lens is not None else [0]),
-        T=T,
+        Tq=Tq,
+        Tk=Tk,
         PRESCALE=prescale,
         HEAD_DIM=HEAD_DIM,
         INPUT_PRECISION=INPUT_PRECISION,
         DTYPE=q.dtype,
-        TIME_BUCKET=triton.next_power_of_2(T),
+        TIME_BUCKET=triton.next_power_of_2(Tq),
+        TILE_Q_SIZE=tile_q,
         LEN_PRESENT=lens is not None,
         SM_SCALE=sm_scale,
     )
@@ -428,12 +442,13 @@ def attention_forward_adapter_abstract(
 
 
 def self_attention_reference(q, k, v, lens):
-    T = q.shape[-2]
+    Tq = q.shape[-2]
 
     attn_mask = None
     if lens is not None:
+        assert Tq == k.shape[-2], f"{(Tq, k.shape[-2])}"
         key_padding_mask = (
-            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+            torch.arange(Tq, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
         ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
@@ -443,20 +458,20 @@ def self_attention_reference(q, k, v, lens):
         res_mask = torch.tensor([True], device="cuda")
 
     return (
-        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask)
+        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) # (B, H, SEQLEN, HEAD_DIM)
         * res_mask,
         res_mask,
     )
 
 
 def self_attention_reference_naive(q, k, v, lens):
-    T = q.shape[-2]
+    Tq = q.shape[-2]
     D = q.shape[-1]
 
     attn_mask = None
     if lens is not None:
         key_padding_mask = (
-            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+            torch.arange(Tq, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
         ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
@@ -505,7 +520,7 @@ if __name__ == "__main__":
     sys.path.insert(0, f"{os.path.dirname(os.path.realpath(__file__))}/../../")
     sys.path.insert(0, f"{os.path.dirname(os.path.realpath(__file__))}/../")
 
-    B, H, T, D = 7, 1, 1, 128
+    B, H, Tk, Tq, D = 7, 2, 32, 1, 128
     context, back = 10, 9
 
     from tests.test_self_attention import test_self_attention
@@ -513,7 +528,8 @@ if __name__ == "__main__":
     test_self_attention(
         B=B,
         H=H,
-        T=T,
+        Tq=Tq,
+        Tk=Tk,
         HEAD_DIM=D,
         dtype=torch.float32,
         lens="none",

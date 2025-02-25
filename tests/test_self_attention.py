@@ -20,7 +20,8 @@ from attention.flash_attn2.flash_attn_triton_alexdremov import (
 # @pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
 # @pytest.mark.parametrize("B", [1, 40, 64], ids=lambda x: f"batch-{x}")
 # @pytest.mark.parametrize("H", [1, 6, 8], ids=lambda x: f"heads-{x}")
-# @pytest.mark.parametrize("T", [1, 10, 16, 800, 1025], ids=lambda x: f"time-{x}")
+# @pytest.mark.parametrize("Tq", [-1], ids=lambda x: f"Tq-{x}")
+# @pytest.mark.parametrize("Tk", [1, 10, 16, 800, 1025], ids=lambda x: f"Tk-{x}")
 # @pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
 @pytest.mark.parametrize("dtype", [torch.float16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize(
@@ -32,12 +33,14 @@ from attention.flash_attn2.flash_attn_triton_alexdremov import (
 @pytest.mark.parametrize("HEAD_DIM", [128], ids=lambda x: f"dim-{x}")
 @pytest.mark.parametrize("B", [1, 40], ids=lambda x: f"batch-{x}")
 @pytest.mark.parametrize("H", [48], ids=lambda x: f"heads-{x}")
-@pytest.mark.parametrize("T", [1025], ids=lambda x: f"time-{x}")
+@pytest.mark.parametrize("Tq", [16], ids=lambda x: f"Tq-{x}")
+@pytest.mark.parametrize("Tk", [1025], ids=lambda x: f"Tk-{x}")
 @pytest.mark.parametrize("autotune", [False], ids=lambda x: f"autotune-{x}")
 def test_self_attention(
     B,
     H,
-    T,
+    Tq,
+    Tk,
     HEAD_DIM,
     dtype,
     lens,
@@ -50,19 +53,24 @@ def test_self_attention(
     torch.set_float32_matmul_precision("highest")
     torch.cuda.empty_cache()
 
+    if Tq == -1:
+        Tq = Tk
+
+    assert Tk >= Tq, f"{(Tk, Tq)}"
+
     if os.environ.get("TRITON_INTERPRET") == "1" and dtype == torch.bfloat16:
         pytest.skip("skipping bf16 in interpreter mode")
 
     if autotune and not (
-        T in {16, 800} and H == 1 and B == 67 and noncontiguous and lens == "tricky"
+        Tk in {16, 800} and H == 1 and B == 67 and noncontiguous and lens == "tricky"
     ):
         pytest.skip("reduced tests for autotune")
 
     shape_mul = 2 if noncontiguous else 1
 
-    q, k, v = [
+    q, k, v = [ # (B, H, SEQLEN, HEAD_DIM)
         torch.testing.make_tensor(
-            (B * shape_mul, H * shape_mul, T * shape_mul, HEAD_DIM * shape_mul),
+            (B * shape_mul, H * shape_mul, Tk * shape_mul, HEAD_DIM * shape_mul),
             dtype=dtype,
             device="cuda",
             requires_grad=True,
@@ -78,6 +86,9 @@ def test_self_attention(
         k = k[1::2, 1::2, 1::2, 1::2].detach().clone().requires_grad_()
         v = v[1::2, 1::2, 1::2, 1::2].detach().clone().requires_grad_()
 
+    # single seqlen_q
+    q = q[:, :, :Tq, :]
+
     if lens == "none":
         lens = None
     elif lens == "tricky":
@@ -85,16 +96,16 @@ def test_self_attention(
             1,
             2,
             5,
-            T + 1,
-            T,
-            max(T // 2, 1),
-            max(T // 4, 1),
+            Tq + 1,
+            Tq,
+            max(Tq // 2, 1),
+            max(Tq // 4, 1),
         ]
         lens = torch.tensor(
             np.random.choice(tricky_lens, B), dtype=torch.int32, device="cuda"
         )
     else:
-        lens = torch.randint(1, T + 1, (B,), dtype=torch.int32, device="cuda")
+        lens = torch.randint(1, Tq + 1, (B,), dtype=torch.int32, device="cuda")
 
     ref, res_mask = self_attention_reference(q, k, v, lens)
     tri_out = self_attention(q, k, v, lens, autotune=autotune)
