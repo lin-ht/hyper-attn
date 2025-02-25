@@ -310,11 +310,11 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
     
     try:
         if impl != "cuda":
-            rst_expected = flash_attn_func_cuda(q, k, v, causal=causal)
+            rst_expected = flash_attn_func_cuda(q, k, v, causal=causal) # flash_attn: (B, S, H, D)
         
             if impl == "triton":
                 # # No encoding:
-                rst, _, deb = flash_attn_func(q, k, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
+                rst, _, deb = flash_attn_func(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
                 # # Encoded:
                 # rst, _, deb = flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)
                 # rst = flash_attn_func(q, k, v, None, causal, None)[0]
@@ -337,7 +337,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
         fn = lambda: flash_attn_func_cuda(q, k, v, causal=causal)
     elif impl == "triton":
         # # No encoding:
-        fn = lambda: flash_attn_func(q, k, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
+        fn = lambda: flash_attn_func(q, k, v, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
         # # Encoded:
         # fn = lambda: flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
     elif impl == "amd":
