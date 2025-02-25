@@ -130,6 +130,8 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 @triton.jit
 def _self_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, 
+    K_scales: tl.tensor,  # B
+    K_zero_points: tl.tensor,  # B
     V_scales: tl.tensor,  # B
     V_zero_points: tl.tensor,  # B
     L: tl.tensor, # L is a list of batch sequence lengths
@@ -141,6 +143,8 @@ def _self_attn_fwd(
     lens_stride: int, # lens L is a 1D vector or None
     Tq: int,  #
     Tk: int,  #
+    K_BITS: tl.constexpr,  # int
+    K_CNTS: tl.constexpr,  # int
     V_BITS: tl.constexpr,  # int
     V_CNTS: tl.constexpr,  # int
     PRESCALE: tl.constexpr,  #
@@ -183,12 +187,13 @@ def _self_attn_fwd(
     )
 
     kbatch_head_offset = batch * stride_kb + head * stride_kh
+    HEAD_DIM_K: tl.constexpr = HEAD_DIM // K_CNTS # assert HEAD_DIM % V_CNTS == 0
     kt_tile_ptr = tl.make_block_ptr(
         base=Kt + kbatch_head_offset,
-        shape=(HEAD_DIM, Tk),
+        shape=(HEAD_DIM_K, Tk),
         strides=(stride_kk, stride_kt),
         offsets=(0, 0),
-        block_shape=(HEAD_DIM, TILE_K_SIZE),
+        block_shape=(HEAD_DIM_K, TILE_K_SIZE),
         order=(0, 1),
     )
 
@@ -236,6 +241,20 @@ def _self_attn_fwd(
             kt_tile = tl.load(
                 tl.advance(kt_tile_ptr, (0, kv_token_idx)),
             )
+        # # dequantize k
+        # tl.debug_barrier()
+        K_BITS_MASK: tl.constexpr = ((1 << K_BITS) - 1)
+        K_BITS_BASE: tl.constexpr = (K_CNTS - 1) * K_BITS
+        k_cnts_arange = tl.arange(0, K_CNTS)
+        kt_ind = (kt_tile[:, None, :] >> (K_BITS_BASE - k_cnts_arange[None, :, None]* K_BITS)) & K_BITS_MASK
+        kt_ind = tl.reshape(kt_ind, [HEAD_DIM, TILE_K_SIZE])
+
+        k_scales_ptr = K_scales + batch
+        k_zero_points_ptr = K_zero_points + batch
+        k_scales_data = tl.load(k_scales_ptr)
+        k_zero_points_data = tl.load(k_zero_points_ptr)
+        kt_tile_decoded = (kt_ind - k_zero_points_data) / k_scales_data
+        
         if V_PRELOAD:
             if last_iter:
                 v_tile = tl.load(
@@ -248,10 +267,10 @@ def _self_attn_fwd(
                 )
 
         if TILE_Q_SIZE == 1:
-            qk = tl.reshape(tl.sum(q_tile * tl.trans(kt_tile), axis=-1), [TILE_Q_SIZE, TILE_K_SIZE])
+            qk = tl.reshape(tl.sum(q_tile * tl.trans(kt_tile_decoded), axis=-1), [TILE_Q_SIZE, TILE_K_SIZE])
         else:
             qk = tl.dot(
-                q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
+                q_tile, kt_tile_decoded, input_precision=INPUT_PRECISION, out_dtype=tl.float32
             )
 
         if not PRESCALE:
@@ -398,6 +417,8 @@ def attention_forward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    k_scales: torch.Tensor,
+    k_zero_points: torch.Tensor,
     v_scales: torch.Tensor,
     v_zero_points: torch.Tensor,
     lens: torch.Tensor,
@@ -407,11 +428,16 @@ def attention_forward_adapter(
 ) -> torch.Tensor:
     batch, heads, Tq, HEAD_DIM = q.shape
     Tk = k.shape[-2]
+    HEAD_DIM_K = k.shape[-1]
     HEAD_DIM_V = v.shape[-1]
     assert HEAD_DIM in {16, 32, 64, 128, 256}
+    assert HEAD_DIM % HEAD_DIM_K == 0
     assert HEAD_DIM % HEAD_DIM_V == 0
+    K_CNTS = HEAD_DIM // HEAD_DIM_K
     V_CNTS = HEAD_DIM // HEAD_DIM_V
+    assert 8 % K_CNTS == 0
     assert 8 % V_CNTS == 0
+    K_BITS = 8 // K_CNTS
     V_BITS = 8 // V_CNTS
     # assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert Tk == v.shape[-2]
@@ -440,6 +466,8 @@ def attention_forward_adapter(
         q,
         kt,
         v,
+        k_scales,
+        k_zero_points,
         v_scales,
         v_zero_points,
         lens,
@@ -451,6 +479,8 @@ def attention_forward_adapter(
         *(strides(lens) if lens is not None else [0]),
         Tq=Tq,
         Tk=Tk,
+        K_BITS=K_BITS,
+        K_CNTS=K_CNTS,
         V_BITS=V_BITS,
         V_CNTS=V_CNTS,
         PRESCALE=prescale,
@@ -470,6 +500,8 @@ def attention_forward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    k_scales: torch.Tensor,
+    k_zero_points: torch.Tensor,
     v_scales: torch.Tensor,
     v_zero_points: torch.Tensor,
     lens: torch.Tensor,
@@ -560,6 +592,8 @@ def self_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    k_scales: torch.Tensor,
+    k_zero_points: torch.Tensor,
     v_scales: torch.Tensor,
     v_zero_points: torch.Tensor,
     lens: torch.Tensor | None,
@@ -574,6 +608,8 @@ def self_attention(
         q,
         k,
         v,
+        k_scales,
+        k_zero_points,
         v_scales,
         v_zero_points,
         lens,
@@ -586,6 +622,8 @@ def self_attention_for_layout(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    k_scales: torch.Tensor,
+    k_zero_points: torch.Tensor,
     v_scales: torch.Tensor,
     v_zero_points: torch.Tensor,
     lens: torch.Tensor | None = None,
@@ -595,13 +633,13 @@ def self_attention_for_layout(
     layout: str = "bshd",
 ):
     if layout == "bhsd":
-        return self_attention(q, k, v, lens, sm_scale, autotune, prescale)
+        return self_attention(q, k, v, k_scales, k_zero_points, v_scales, v_zero_points, lens, sm_scale, autotune, prescale)
     
     # elif layout == "bshd":
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    o = self_attention(q, k, v, v_scales, v_zero_points, lens, sm_scale, autotune, prescale)
+    o = self_attention(q, k, v, k_scales, k_zero_points, v_scales, v_zero_points, lens, sm_scale, autotune, prescale)
     return o.transpose(1, 2)
 
 
@@ -622,6 +660,7 @@ if __name__ == "__main__":
         Tq=Tq,
         Tk=Tk,
         HEAD_DIM=D,
+        LAYOUT="bshd",
         dtype=torch.float32,
         lens="none",
         noncontiguous=False,

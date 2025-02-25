@@ -23,7 +23,7 @@ def check_diff(rst, rst_expected, prefix="", verbose=True):
     return is_allclose, max_err, mean_err
 
 
-def test_diff(rst, ref, lens, LAYOUT, atol = 1e-3, prefix=""):
+def test_diff(rst, ref, lens, LAYOUT, atol = 0.05, prefix=""):
     diff = rst - ref
     if LAYOUT == "bshd":
         diff = diff.transpose(1, 2)
@@ -259,7 +259,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal=False, mode="alex
     LAYOUT = "bshd"
 
     ref, res_mask = self_attention_reference(q, k, v, lens, layout=LAYOUT)
-    tri_out = self_attention_for_layout(q, k, v_ind_encoded, v_scales, v_zero_points, lens, autotune=False, layout=LAYOUT)
+    tri_out = self_attention_for_layout(q, k_ind_encoded, v_ind_encoded, k_scales, k_zero_points, v_scales, v_zero_points, lens, autotune=False, layout=LAYOUT)
     ref_fa2 = self_attention_fa2(q, k, v, layout=LAYOUT)
 
     # torch.set_printoptions(linewidth=400, profile="full")

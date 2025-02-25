@@ -325,7 +325,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
             elif impl == "alex":
-                rst = flash_attn_func_alex(q, k, v_ind_encoded, v_scales, v_zero_points)
+                rst = flash_attn_func_alex(q, k_ind_encoded, v_ind_encoded, k_scales, k_zero_points, v_scales, v_zero_points)
 
             is_allclose = torch.allclose(rst, rst_expected)
             max_err = (rst - rst_expected).abs().max()
@@ -346,7 +346,7 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
     elif impl == "amd":
         fn = lambda: flash_attn_func_amd(q, k, v, causal)[0]
     elif impl == "alex":
-        fn = lambda: flash_attn_func_alex(q, k, v_ind_encoded, v_scales, v_zero_points)
+        fn = lambda: flash_attn_func_alex(q, k_ind_encoded, v_ind_encoded, k_scales, k_zero_points, v_scales, v_zero_points)
     else:  # impl == "xformers"
         fn = lambda: flash_attn_func_xformers(q, k, v, None, causal, None)[0]
 
