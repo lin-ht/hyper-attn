@@ -367,9 +367,9 @@ def autotune_posthook(kwargs, exception=None):
 
 streaming_forward = triton.heuristics(
     dict(
-        PIPELINING=lambda _: 1, # TODO: Tune PIPELINING? lambda args: min(args["Tk"], 4) if args["Tq"] == 1 else 1,
+        PIPELINING=lambda args: min(args["Tk"], 8) if args["Tq"] == 1 else 1,
         # TILE_Q_SIZE=lambda args: min(args["Tq"], 64),
-        TILE_K_SIZE=lambda _: 64,
+        TILE_K_SIZE=lambda _: 32,
     )
 )(_self_attn_fwd)
 
