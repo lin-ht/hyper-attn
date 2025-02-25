@@ -129,7 +129,10 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 )
 @triton.jit
 def _self_attn_fwd(
-    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, # L is a list of batch sequence lengths
+    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, 
+    V_scales: tl.tensor,  # B
+    V_zero_points: tl.tensor,  # B
+    L: tl.tensor, # L is a list of batch sequence lengths
     O: tl.tensor,  #
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
@@ -138,6 +141,8 @@ def _self_attn_fwd(
     lens_stride: int, # lens L is a 1D vector or None
     Tq: int,  #
     Tk: int,  #
+    V_BITS: tl.constexpr,  # int
+    V_CNTS: tl.constexpr,  # int
     PRESCALE: tl.constexpr,  #
     TIME_BUCKET:  int,  #
     LEN_PRESENT: tl.constexpr,  #
@@ -188,12 +193,13 @@ def _self_attn_fwd(
     )
 
     vbatch_head_offset = batch * stride_vb + head * stride_vh
+    HEAD_DIM_V: tl.constexpr = HEAD_DIM // V_CNTS # assert HEAD_DIM % V_CNTS == 0
     v_tile_ptr = tl.make_block_ptr(
         base=V + vbatch_head_offset,
-        shape=(Tk, HEAD_DIM),
+        shape=(Tk, HEAD_DIM_V),
         strides=(stride_vt, stride_vk),
         offsets=(0, 0),
-        block_shape=(TILE_K_SIZE, HEAD_DIM),
+        block_shape=(TILE_K_SIZE, HEAD_DIM_V),
         order=(1, 0),
     )
 
@@ -278,13 +284,28 @@ def _self_attn_fwd(
             else:
                 v_tile = tl.load(
                     tl.advance(v_tile_ptr, (kv_token_idx, 0)),
-                ) # (TILE_K_SIZE, HEAD_DIM)
+                ) # (TILE_K_SIZE, HEAD_DIM_V)
+
+        # # dequantize v
+        # tl.debug_barrier()
+        V_BITS_MASK: tl.constexpr = ((1 << V_BITS) - 1)
+        V_BITS_BASE: tl.constexpr = (V_CNTS - 1) * V_BITS
+        v_cnts_arange = tl.arange(0, V_CNTS)
+        v_ind = (v_tile[:, :, None] >> (V_BITS_BASE - v_cnts_arange[None, None, :]* V_BITS)) & V_BITS_MASK
+        v_ind = tl.reshape(v_ind, [TILE_K_SIZE, HEAD_DIM])
+
+        v_scales_ptr = V_scales + batch
+        v_zero_points_ptr = V_zero_points + batch
+        v_scales_data = tl.load(v_scales_ptr)
+        v_zero_points_data = tl.load(v_zero_points_ptr)
+        v_tile_decoded = (v_ind - v_zero_points_data) / v_scales_data
+
         if TILE_Q_SIZE == 1:
-            acc += tl.sum(p[:, :, None].to(v_tile.dtype) * v_tile[None, :, :], axis=1) # (TILE_Q_SIZE, HEAD_DIM)
+            acc += tl.sum(p[:, :, None] * v_tile_decoded[None, :, :].to(p.dtype), axis=1) # (TILE_Q_SIZE, HEAD_DIM)
         else:
             acc = tl.dot(
-                p.to(v_tile.dtype),
-                v_tile,
+                p,
+                v_tile_decoded.to(p.dtype),
                 acc,
                 input_precision=INPUT_PRECISION,
                 out_dtype=tl.float32,
@@ -377,6 +398,8 @@ def attention_forward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zero_points: torch.Tensor,
     lens: torch.Tensor,
     sm_scale: float,
     autotune: bool,
@@ -384,9 +407,13 @@ def attention_forward_adapter(
 ) -> torch.Tensor:
     batch, heads, Tq, HEAD_DIM = q.shape
     Tk = k.shape[-2]
-
+    HEAD_DIM_V = v.shape[-1]
     assert HEAD_DIM in {16, 32, 64, 128, 256}
-    assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
+    assert HEAD_DIM % HEAD_DIM_V == 0
+    V_CNTS = HEAD_DIM // HEAD_DIM_V
+    assert 8 % V_CNTS == 0
+    V_BITS = 8 // V_CNTS
+    # assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert Tk == v.shape[-2]
     # assert Tq == k.shape[-2] and Tq == v.shape[-2]
     assert sm_scale is not None
@@ -413,6 +440,8 @@ def attention_forward_adapter(
         q,
         kt,
         v,
+        v_scales,
+        v_zero_points,
         lens,
         O,
         *strides(q),
@@ -422,6 +451,8 @@ def attention_forward_adapter(
         *(strides(lens) if lens is not None else [0]),
         Tq=Tq,
         Tk=Tk,
+        V_BITS=V_BITS,
+        V_CNTS=V_CNTS,
         PRESCALE=prescale,
         HEAD_DIM=HEAD_DIM,
         INPUT_PRECISION=INPUT_PRECISION,
@@ -439,6 +470,8 @@ def attention_forward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zero_points: torch.Tensor,
     lens: torch.Tensor,
     sm_scale: float,
     autotune: bool,
@@ -527,6 +560,8 @@ def self_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zero_points: torch.Tensor,
     lens: torch.Tensor | None,
     sm_scale: float | None = None,
     autotune=True,
@@ -539,6 +574,8 @@ def self_attention(
         q,
         k,
         v,
+        v_scales,
+        v_zero_points,
         lens,
         sm_scale,
         autotune,
@@ -549,6 +586,8 @@ def self_attention_for_layout(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zero_points: torch.Tensor,
     lens: torch.Tensor | None = None,
     sm_scale: float | None = None,
     autotune=False,
@@ -562,7 +601,7 @@ def self_attention_for_layout(
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    o = self_attention(q, k, v, lens, sm_scale, autotune, prescale)
+    o = self_attention(q, k, v, v_scales, v_zero_points, lens, sm_scale, autotune, prescale)
     return o.transpose(1, 2)
 
 
