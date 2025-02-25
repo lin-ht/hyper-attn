@@ -7,6 +7,12 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+try:
+    from flash_attn import flash_attn_func as flash_attn_func_cuda
+except ImportError as e:
+    flash_attn_func_cuda = None
+    print(f"flash_attn importError: {e}")
+
 MAX_TILE_SIZE = 256
 MIN_TILE_SIZE = 32
 
@@ -443,24 +449,49 @@ def attention_forward_adapter_abstract(
     return torch.empty_like(q, memory_format=torch.contiguous_format)
 
 
-def self_attention_reference(q, k, v, lens):
+def self_attention_fa2(q, k, v, layout: str = "bshd"):
+    # flash_attn: (B, S, H, D)
+    if layout == "bshd":
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        o = flash_attn_func_cuda(q, k, v, causal=False)
+    else:
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        o = flash_attn_func_cuda(q, k, v, causal=False)
+        o = o.transpose(1, 2)
+    return o
+
+def self_attention_reference(q, k, v, lens, layout:str = "bshd"):
+    if layout == "bshd":
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
     T = q.shape[-2]
 
     attn_mask = None
     if lens is not None:
         key_padding_mask = (
             torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
-        ).unsqueeze(-1)
+        ).unsqueeze(-1) # (1, T:SEQLEN, 1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
-        attn_mask = key_padding_mask.unsqueeze(1)
-        res_mask = key_padding_mask_ref.unsqueeze(1)
+        attn_mask = key_padding_mask.unsqueeze(1) # (1, 1, T, T)
+        res_mask = key_padding_mask_ref.unsqueeze(1) # (1, 1, T, 1)
     else:
         res_mask = torch.tensor([True], device="cuda")
 
+    o =F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) * res_mask # (B, H, T:SEQLEN, HEAD_DIM)
+    if layout == "bshd":
+        o = o.transpose(1, 2)
+        if res_mask.ndim == 4:
+            res_mask = res_mask.transpose(1, 2)
+
     return (
-        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) # (B, H, T:SEQLEN, HEAD_DIM)
-        * res_mask,
+        o, 
         res_mask,
     )
 
@@ -514,6 +545,27 @@ def self_attention(
         autotune,
         prescale,
     )
+
+def self_attention_for_layout(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor | None = None,
+    sm_scale: float | None = None,
+    autotune=False,
+    prescale=False,
+    layout: str = "bshd",
+):
+    if layout == "bhsd":
+        return self_attention(q, k, v, lens, sm_scale, autotune, prescale)
+    
+    # elif layout == "bshd":
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    o = self_attention(q, k, v, lens, sm_scale, autotune, prescale)
+    return o.transpose(1, 2)
+
 
 if __name__ == "__main__":
     import sys
