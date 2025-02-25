@@ -91,32 +91,47 @@ def test_self_attention(
     shape_mul = 2 if noncontiguous else 1
 
     if LAYOUT == "bhsd":
-        shape_tuple = (B * shape_mul, H * shape_mul, Tk * shape_mul, HEAD_DIM * shape_mul)    
+        shape_tuple_q = (B * shape_mul, H * shape_mul, Tq * shape_mul, HEAD_DIM * shape_mul)
+        shape_tuple_k = (B * shape_mul, H * shape_mul, Tk * shape_mul, HEAD_DIM * shape_mul)
     else:
-        shape_tuple = (B * shape_mul, Tk * shape_mul, H * shape_mul, HEAD_DIM * shape_mul)
-
-    q, k, v = [ # (B, H, SEQLEN, HEAD_DIM)
-        torch.testing.make_tensor(
-            shape_tuple,
-            dtype=dtype,
-            device="cuda",
-            requires_grad=True,
-            noncontiguous=noncontiguous,
-            low=-0.1,
-            high=0.1,
-        )
-        for _ in range(3)
-    ]
+        shape_tuple_q = (B * shape_mul, Tq * shape_mul, H * shape_mul, HEAD_DIM * shape_mul)
+        shape_tuple_k = (B * shape_mul, Tk * shape_mul, H * shape_mul, HEAD_DIM * shape_mul)
 
     if noncontiguous:
         slice_obj = slice(shape_mul-1, None, shape_mul)
-        q = q[slice_obj, slice_obj, slice_obj, slice_obj].detach().clone().requires_grad_()
-        k = k[slice_obj, slice_obj, slice_obj, slice_obj].detach().clone().requires_grad_()
-        v = v[slice_obj, slice_obj, slice_obj, slice_obj].detach().clone().requires_grad_()
+    else:
+        slice_obj = slice(None)
 
-    # single seqlen_q
-    q = q[:, :, :Tq, :] if LAYOUT == "bhsd" else q[:, :Tq, :, :]
-
+    # (B, H, SEQLEN, HEAD_DIM)
+    val_mag = 1.0
+    requires_grad = True
+    q = torch.testing.make_tensor(
+            shape_tuple_q,
+            dtype=dtype,
+            device="cuda",
+            requires_grad=requires_grad,
+            noncontiguous=noncontiguous,
+            low=-val_mag,
+            high=val_mag,
+        )[slice_obj, slice_obj, slice_obj, slice_obj].detach().clone()
+    k, v = [
+        torch.testing.make_tensor(
+            shape_tuple_k,
+            dtype=dtype,
+            device="cuda",
+            requires_grad=requires_grad,
+            noncontiguous=noncontiguous,
+            low=-val_mag,
+            high=val_mag,
+        )[slice_obj, slice_obj, slice_obj, slice_obj].detach().clone()
+        for _ in range(2)
+    ]
+    
+    if requires_grad:
+        q = q.requires_grad_()
+        k = k.requires_grad_()
+        v = v.requires_grad_()
+    
     if lens == "none":
         lens = None
     elif lens == "tricky":
@@ -138,9 +153,6 @@ def test_self_attention(
     ref, res_mask = self_attention_reference(q, k, v, lens, layout=LAYOUT)
     tri_out = self_attention_for_layout(q, k, v, lens, autotune=autotune, layout=LAYOUT)
     ref_fa2 = self_attention_fa2(q, k, v, layout=LAYOUT)
-    # ref, res_mask = self_attention_reference(q.detach().clone(), k.detach().clone(), v.detach().clone(), lens, layout=LAYOUT)
-    # ref_fa2 = self_attention_fa2(q.detach().clone(), k.detach().clone(), v.detach().clone(), layout=LAYOUT)
-    # tri_out = self_attention_for_layout(q.detach().clone(), k.detach().clone(), v.detach().clone(), lens, autotune=autotune, layout=LAYOUT)
 
     # torch.set_printoptions(linewidth=400, profile="full")
     ref_fa2 = ref_fa2 * res_mask.broadcast_to(ref_fa2.shape)
@@ -153,13 +165,13 @@ def test_self_attention(
 
 if __name__ == "__main__":
     test_self_attention(
-        B=40,
+        B=10,
         H=48,
         Tq=1,
-        Tk=1025,
+        Tk=3200,
         HEAD_DIM=128,
         LAYOUT="bhsd",
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         lens="none",
         noncontiguous=True,
         autotune=False,
