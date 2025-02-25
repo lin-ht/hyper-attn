@@ -21,7 +21,7 @@ def get_arguments():
     parser.add_argument("--no_causal", action="store_true")
     parser.add_argument("--mode", type=str, default="fwd", choices=['fwd', 'bwd', 'fwd+bwd'])
     parser.add_argument("--attn_method", type=str, default="flash", choices=['flash', 'hyper'])
-    parser.add_argument("--impl", type=str, default="triton", choices=['cuda', 'triton', 'amd', 'alex', 'xformers'])
+    parser.add_argument("--impl", type=str, default="alex", choices=['cuda', 'triton', 'amd', 'alex', 'xformers'])
     parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument("--head_size", type=int, default=48)
     parser.add_argument("--dim", type=int, default=128)
