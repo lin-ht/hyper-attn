@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from attention.flash_attn2.flash_attn_triton_amd import flash_attn_func as flash_attn_func_amd
+from attention.flash_attn2.flash_attn_triton_alexdremov import self_attention_for_layout as flash_attn_func_alex
 from attention.flash_attn2.flash_attn_triton_quantized import flash_attn_func
 from attention.hyper_attn.hyper_attn import HyperAttention
 from attention.flash_attn2.flash_attn_xformers import flash_attn_func as flash_attn_func_xformers
@@ -20,7 +21,7 @@ def get_arguments():
     parser.add_argument("--no_causal", action="store_true")
     parser.add_argument("--mode", type=str, default="fwd", choices=['fwd', 'bwd', 'fwd+bwd'])
     parser.add_argument("--attn_method", type=str, default="flash", choices=['flash', 'hyper'])
-    parser.add_argument("--impl", type=str, default="triton", choices=['cuda', 'triton', 'amd', 'xformers'])
+    parser.add_argument("--impl", type=str, default="triton", choices=['cuda', 'triton', 'amd', 'alex', 'xformers'])
     parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument("--head_size", type=int, default=48)
     parser.add_argument("--dim", type=int, default=128)
@@ -323,6 +324,8 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
                 # check_diff(deb[:,0:seq_len,:,:], k.to(deb.dtype))
             elif impl == "amd":
                 rst = flash_attn_func_amd(q, k, v, causal)[0]
+            elif impl == "alex":
+                rst = flash_attn_func_alex(q, k, v)
 
             is_allclose = torch.allclose(rst, rst_expected)
             max_err = (rst - rst_expected).abs().max()
@@ -342,6 +345,8 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal, mode, impl="trit
         # fn = lambda: flash_attn_func(q, k_ind_encoded, v_ind_encoded, k_bits, k_scales, k_zero_points, v_bits, v_scales, v_zero_points, None, causal, None)[0]
     elif impl == "amd":
         fn = lambda: flash_attn_func_amd(q, k, v, causal)[0]
+    elif impl == "alex":
+        fn = lambda: flash_attn_func_alex(q, k, v)
     else:  # impl == "xformers"
         fn = lambda: flash_attn_func_xformers(q, k, v, None, causal, None)[0]
 
