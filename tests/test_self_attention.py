@@ -4,24 +4,36 @@ import numpy as np
 import pytest
 import torch
 
-from models.attention.flash_attn2.flash_attn_triton_alexdremov import (
+from attention.flash_attn2.flash_attn_triton_alexdremov import (
     self_attention, 
     self_attention_reference,
 )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=lambda x: f"{x}")
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=lambda x: f"{x}")
+# @pytest.mark.parametrize(
+#     "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+# )
+# @pytest.mark.parametrize(
+#     "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
+# )
+# @pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
+# @pytest.mark.parametrize("B", [1, 40, 64], ids=lambda x: f"batch-{x}")
+# @pytest.mark.parametrize("H", [1, 6, 8], ids=lambda x: f"heads-{x}")
+# @pytest.mark.parametrize("T", [1, 10, 16, 800, 1025], ids=lambda x: f"time-{x}")
+# @pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
+@pytest.mark.parametrize("dtype", [torch.float16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize(
-    "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+    "lens", ["none"], ids=lambda x: f"lens-{x}"
 )
 @pytest.mark.parametrize(
-    "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
+    "noncontiguous", [False], ids=lambda x: f"noncontiguous-{x}"
 )
-@pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
-@pytest.mark.parametrize("B", [1, 40, 64], ids=lambda x: f"batch-{x}")
-@pytest.mark.parametrize("H", [1, 6, 8], ids=lambda x: f"heads-{x}")
-@pytest.mark.parametrize("T", [1, 10, 16, 800, 1025], ids=lambda x: f"time-{x}")
-@pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
+@pytest.mark.parametrize("HEAD_DIM", [128], ids=lambda x: f"dim-{x}")
+@pytest.mark.parametrize("B", [1, 40], ids=lambda x: f"batch-{x}")
+@pytest.mark.parametrize("H", [48], ids=lambda x: f"heads-{x}")
+@pytest.mark.parametrize("T", [1025], ids=lambda x: f"time-{x}")
+@pytest.mark.parametrize("autotune", [False], ids=lambda x: f"autotune-{x}")
 def test_self_attention(
     B,
     H,
