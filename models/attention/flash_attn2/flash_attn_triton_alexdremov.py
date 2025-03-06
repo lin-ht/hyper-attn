@@ -143,6 +143,7 @@ def _self_attn_fwd(
     lens_stride: int, # lens L is a 1D vector or None
     Tq: int,  #
     Tk: int,  #
+    GROUP_SIZE: tl.constexpr,  #
     K_BITS: tl.constexpr,  # int
     K_CNTS: tl.constexpr,  # int
     V_BITS: tl.constexpr,  # int
@@ -186,7 +187,7 @@ def _self_attn_fwd(
         order=(1, 0),
     )
 
-    kbatch_head_offset = batch * stride_kb + head * stride_kh
+    kbatch_head_offset = batch * stride_kb + (head % GROUP_SIZE) * stride_kh
     HEAD_DIM_K: tl.constexpr = HEAD_DIM // K_CNTS # assert HEAD_DIM % V_CNTS == 0
     kt_tile_ptr = tl.make_block_ptr(
         base=Kt + kbatch_head_offset,
@@ -197,7 +198,7 @@ def _self_attn_fwd(
         order=(0, 1),
     )
 
-    vbatch_head_offset = batch * stride_vb + head * stride_vh
+    vbatch_head_offset = batch * stride_vb + (head % GROUP_SIZE) * stride_vh
     HEAD_DIM_V: tl.constexpr = HEAD_DIM // V_CNTS # assert HEAD_DIM % V_CNTS == 0
     v_tile_ptr = tl.make_block_ptr(
         base=V + vbatch_head_offset,
@@ -427,8 +428,7 @@ def attention_forward_adapter(
     prescale: bool,
 ) -> torch.Tensor:
     batch, heads, Tq, HEAD_DIM = q.shape
-    Tk = k.shape[-2]
-    HEAD_DIM_K = k.shape[-1]
+    _, heads_k, Tk, HEAD_DIM_K = k.shape
     HEAD_DIM_V = v.shape[-1]
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM % HEAD_DIM_K == 0
@@ -446,6 +446,7 @@ def attention_forward_adapter(
     assert lens is None or (
         lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1
     )
+    assert heads % heads_k == 0, f"Invalid num of heads for (query, key) = {(heads, heads_k)}"
 
     O = torch.zeros_like(q, memory_format=torch.contiguous_format)
     INPUT_PRECISION = (
@@ -479,6 +480,7 @@ def attention_forward_adapter(
         *(strides(lens) if lens is not None else [0]),
         Tq=Tq,
         Tk=Tk,
+        GROUP_SIZE = heads_k,
         K_BITS=K_BITS,
         K_CNTS=K_CNTS,
         V_BITS=V_BITS,

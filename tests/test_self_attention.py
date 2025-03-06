@@ -174,10 +174,12 @@ def test_self_attention(
     print("Passed!")
 
 
-def get_tensors(batch_size, seq_len, head_size, dim, dtype=torch.bfloat16):
+def get_tensors(batch_size, seq_len, head_size, dim, dtype=torch.bfloat16, n_groups=1):
+    assert head_size % n_groups == 0, f"Number of heads must be divisible by number of groups ({head_size} % {n_groups})"
+    nh_k = head_size // n_groups
     q = torch.randn((batch_size, 1, head_size, dim), dtype=dtype, device="cuda", requires_grad=True)
-    k = torch.randn((batch_size, seq_len, head_size, dim), dtype=dtype, device="cuda", requires_grad=True)
-    v = torch.randn((batch_size, seq_len, head_size, dim), dtype=dtype, device="cuda", requires_grad=True)
+    k = torch.randn((batch_size, seq_len, nh_k, dim), dtype=dtype, device="cuda", requires_grad=True)
+    v = torch.randn((batch_size, seq_len, nh_k, dim), dtype=dtype, device="cuda", requires_grad=True)
     return q, k, v
 
 
@@ -220,9 +222,9 @@ def encode_torch(x, bits):
     return x_encoded
 
 
-def run_flash_attn(batch_size, head_size, seq_len, dim, causal=False, mode="alex", impl="triton", warmup=20, rep=100):
+def run_flash_attn(batch_size, head_size, seq_len, dim, n_groups, causal=False, mode="alex", impl="triton", warmup=20, rep=100):
     # torch.manual_seed(0)
-    q, k, v = get_tensors(batch_size, seq_len, head_size, dim)
+    q, k, v = get_tensors(batch_size, seq_len, head_size, dim, n_groups=n_groups)
 
     def print_stats(t, prefix=""):
         print(f"{prefix}: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item()}, std={t.std().item()}")
@@ -251,16 +253,20 @@ def run_flash_attn(batch_size, head_size, seq_len, dim, causal=False, mode="alex
 
     k = k_deq
     v = v_deq
+    k_ext = k.unsqueeze(-3).expand(-1, -1, n_groups, -1, -1).reshape(batch_size, seq_len, head_size, dim)
+    v_ext = v.unsqueeze(-3).expand(-1, -1, n_groups, -1, -1).reshape(batch_size, seq_len, head_size, dim)
 
     print_stats(k, "k_final")
     print_stats(v, "v_final")
+    print_stats(k_ext, "k_ext_final")
+    print_stats(v_ext, "v_ext_final")
 
     lens = None
     LAYOUT = "bshd"
 
-    ref, res_mask = self_attention_reference(q, k, v, lens, layout=LAYOUT)
+    ref, res_mask = self_attention_reference(q, k_ext, v_ext, lens, layout=LAYOUT)
     tri_out = self_attention_for_layout(q, k_ind_encoded, v_ind_encoded, k_scales, k_zero_points, v_scales, v_zero_points, lens, autotune=False, layout=LAYOUT)
-    ref_fa2 = self_attention_fa2(q, k, v, layout=LAYOUT)
+    ref_fa2 = self_attention_fa2(q, k_ext, v_ext, layout=LAYOUT)
 
     # torch.set_printoptions(linewidth=400, profile="full")
     ref_fa2 = ref_fa2 * res_mask.broadcast_to(ref_fa2.shape)
@@ -280,7 +286,7 @@ if __name__ == "__main__":
     Tk=3200
     HEAD_DIM=128
 
-    run_flash_attn(B, H, Tk, HEAD_DIM)
+    run_flash_attn(B, H, Tk, HEAD_DIM, n_groups=6)
 
     # test_self_attention(
     #     B=B,
